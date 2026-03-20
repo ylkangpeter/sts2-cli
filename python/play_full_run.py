@@ -85,11 +85,14 @@ def play_run(seed: str, character: str = "Ironclad", verbose: bool = True):
 
             decision = state.get("decision", "")
 
-            # Stuck detection
-            state_key = f"{decision}:{state.get('round')}:{state.get('player',{}).get('hp')}"
+            # Stuck detection — use comprehensive state key
+            hand_len = len(state.get("hand", []))
+            enemy_hp = sum(e.get("hp", 0) for e in state.get("enemies", []))
+            energy = state.get("energy", 0)
+            state_key = f"{decision}:{state.get('round')}:{state.get('player',{}).get('hp')}:{hand_len}:{enemy_hp}:{energy}"
             if state_key == last_state_key:
                 stuck_count += 1
-                if stuck_count > 15:
+                if stuck_count > 20:
                     print(f"  STUCK after {step} steps, forcing quit")
                     return {"victory": False, "seed": seed, "steps": step,
                             "act": state.get("act"), "floor": state.get("floor"),

@@ -116,13 +116,20 @@ public class AssemblyHasScriptsAttribute : Attribute
 // Colors - static color constants
 public static class Colors
 {
-    public static readonly Color White = Color.White;
-    public static readonly Color Black = Color.Black;
-    public static readonly Color Red = new(1, 0, 0);
-    public static readonly Color Green = new(0, 1, 0);
-    public static readonly Color Blue = new(0, 0, 1);
-    public static readonly Color Yellow = new(1, 1, 0);
-    public static readonly Color Transparent = Color.Transparent;
+    public static Color White { get; } = Color.White;
+    public static Color Black { get; } = Color.Black;
+    public static Color Red { get; } = new(1, 0, 0);
+    public static Color Green { get; } = new(0, 1, 0);
+    public static Color Blue { get; } = new(0, 0, 1);
+    public static Color Yellow { get; } = new(1, 1, 0);
+    public static Color Transparent { get; } = Color.Transparent;
+    public static Color Orange { get; } = new(1, 0.65f, 0);
+    public static Color Purple { get; } = new(0.63f, 0.13f, 0.94f);
+    public static Color Cyan { get; } = new(0, 1, 1);
+    public static Color Magenta { get; } = new(1, 0, 1);
+    public static Color Gray { get; } = new(0.5f, 0.5f, 0.5f);
+    public static Color DarkGray { get; } = new(0.25f, 0.25f, 0.25f);
+    public static Color LightGray { get; } = new(0.75f, 0.75f, 0.75f);
 }
 
 // Range control

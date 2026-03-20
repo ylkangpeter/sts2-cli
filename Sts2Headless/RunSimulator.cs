@@ -291,32 +291,9 @@ public class RunSimulator
         _turnStarted.Reset();
         _combatEnded.Reset();
 
-        // EndTurn triggers async chain with Task.Yield() on ThreadPool.
-        // We poll for state change to detect completion.
-        var prevHp = player.Creature.CurrentHp;
-        var prevEnemyHp = CombatManager.Instance.DebugOnlyGetState()?.Enemies?
-            .Where(e => e != null && e.IsAlive).Sum(e => e.CurrentHp) ?? 0;
-        var prevRound = CombatManager.Instance.DebugOnlyGetState()?.RoundNumber ?? 0;
-
+        // With Task.Yield() patched out of sts2.dll, EndTurn should complete synchronously.
         PlayerCmd.EndTurn(player, canBackOut: false);
         _syncCtx.Pump();
-
-        // Wait for turn transition — detect by state changes
-        for (int i = 0; i < 200; i++)
-        {
-            _syncCtx.Pump();
-            if (_turnStarted.IsSet || _combatEnded.IsSet) break;
-            if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
-
-            var curRound = CombatManager.Instance.DebugOnlyGetState()?.RoundNumber ?? 0;
-            if (curRound > prevRound) break;
-
-            // Also detect state change by HP change (enemy turn happened)
-            var curHp = player.Creature.CurrentHp;
-            if (curHp != prevHp) { Thread.Sleep(50); _syncCtx.Pump(); break; }
-
-            Thread.Sleep(5);
-        }
 
         return DetectDecisionPoint();
     }
@@ -442,43 +419,27 @@ public class RunSimulator
         // Combat room
         if (room is CombatRoom combatRoom)
         {
-            // Wait for combat to initialize (StartCombatInternal runs via RunSafely)
-            // In TestMode async resolves synchronously, but we need to pump the task system
-            for (int i = 0; i < 50 && !CombatManager.Instance.IsPlayPhase && !player.Creature.IsDead; i++)
-            {
-                WaitForActionExecutor();
-                Thread.Sleep(10);
-            }
+            // With Task.Yield() patched, combat init should be synchronous
+            _syncCtx.Pump();
+            WaitForActionExecutor();
 
-            if (CombatManager.Instance.IsInProgress)
+            if (CombatManager.Instance.IsInProgress && CombatManager.Instance.IsPlayPhase)
             {
-                if (CombatManager.Instance.IsPlayPhase)
-                {
-                    return CombatPlayState(player);
-                }
-                // Enemy turn or between phases — wait more
-                SpinWaitForCombatStable();
-                if (CombatManager.Instance.IsPlayPhase)
-                    return CombatPlayState(player);
-                if (!CombatManager.Instance.IsInProgress)
-                {
-                    return DetectPostCombatState(player, combatRoom);
-                }
-                // Still not in play phase — return combat state anyway
                 return CombatPlayState(player);
             }
-            else if (combatRoom.IsPreFinished)
+            if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead)
             {
-                // Pre-finished combat (e.g., loaded from save) — proceed
                 return DetectPostCombatState(player, combatRoom);
             }
-            else
+            // Fallback: brief wait
+            for (int i = 0; i < 20; i++)
             {
-                // Combat not started yet — this shouldn't happen in TestMode
-                // but try proceeding anyway
-                Log($"Combat not in progress for {combatRoom.RoomType}, checking enemies");
-                return DetectPostCombatState(player, combatRoom);
+                _syncCtx.Pump();
+                Thread.Sleep(5);
+                if (CombatManager.Instance.IsPlayPhase) return CombatPlayState(player);
+                if (!CombatManager.Instance.IsInProgress) return DetectPostCombatState(player, combatRoom);
             }
+            return CombatPlayState(player);
         }
 
         // Event room
