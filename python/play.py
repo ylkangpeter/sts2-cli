@@ -20,16 +20,24 @@ DOTNET = os.path.expanduser("~/.dotnet-arm64/dotnet")
 PROJECT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                        "Sts2Headless", "Sts2Headless.csproj")
 
+# Language setting (set by --lang flag)
+LANG = "both"  # "en", "zh", or "both"
+
 # ─── Display helpers ───
 
 def n(obj):
-    """Extract bilingual display name."""
+    """Extract display name based on language setting."""
     if isinstance(obj, dict):
         if "en" in obj:
+            en = obj["en"]
             zh = obj.get("zh")
-            if zh and zh != obj["en"]:
-                return f"{obj['en']}({zh})"
-            return obj["en"]
+            if LANG == "zh" and zh:
+                return zh
+            elif LANG == "en":
+                return en
+            elif zh and zh != en:
+                return f"{en}({zh})"
+            return en
     return str(obj)
 
 def short_n(obj):
@@ -42,11 +50,16 @@ def desc(obj):
     """Extract description, strip BBCode tags, clean template vars."""
     if isinstance(obj, dict) and "en" in obj:
         import re
-        text = obj.get("zh") or obj.get("en") or ""
+        if LANG == "zh" and obj.get("zh"):
+            text = obj["zh"]
+        elif LANG == "en":
+            text = obj["en"]
+        else:
+            text = obj.get("zh") or obj.get("en") or ""
         text = re.sub(r'\[/?[^\]]+\]', '', text)  # strip [tags]
         # Clean template vars: {Heal} → [Heal], {Damage:diff()} → [Damage]
         def clean_var(m):
-            var = m.group(1).split(':')[0]  # take name before ':'
+            var = m.group(1).split(':')[0]
             return f"[{var}]"
         text = re.sub(r'\{([^}]+)\}', clean_var, text)
         return text.strip()
@@ -67,11 +80,27 @@ def bar(current, maximum, width=20):
 
 # ─── Game display ───
 
+def resolve_template(text, vars_dict):
+    """Replace [VarName] in text with actual values from vars dict."""
+    if not vars_dict or not text:
+        return text
+    import re
+    def replacer(m):
+        key = m.group(1)
+        val = vars_dict.get(key)
+        if val is not None:
+            return str(val)
+        return f"[{key}]"
+    return re.sub(r'\[(\w+)\]', replacer, text)
+
 def relic_str(r):
-    """Format a relic with name and cleaned description."""
+    """Format a relic with name and resolved description."""
     if isinstance(r, dict) and "name" in r:
         name = n(r["name"])
         d = desc(r.get("description", {}))
+        # Resolve template vars with actual values
+        vars_dict = r.get("vars") or {}
+        d = resolve_template(d, vars_dict)
         return f"{name}" + (f": {c(d, 'dim')}" if d else "")
     return n(r)
 
@@ -597,6 +626,12 @@ def play(character="Ironclad", seed=None, auto=False):
                 valid = {str(o["index"]): o for o in unlocked}
                 valid["leave"] = None
 
+                # Save state before choice to show diff
+                old_relics = set(n(r.get("name","?")) for r in state.get("player",{}).get("relics",[]))
+                old_deck = state.get("player",{}).get("deck_size", 0)
+                old_hp = state.get("player",{}).get("hp", 0)
+                old_gold = state.get("player",{}).get("gold", 0)
+
                 if auto:
                     choice = str(unlocked[0]["index"]) if unlocked else "leave"
                 else:
@@ -609,6 +644,27 @@ def play(character="Ironclad", seed=None, auto=False):
                                  "args": {"option_index": int(choice)}})
                     if state and state.get("type") == "error":
                         state = send({"cmd": "action", "action": "leave_room"})
+
+                # Show what changed
+                if state and state.get("player"):
+                    new_p = state["player"]
+                    new_relics = set(n(r.get("name","?")) for r in new_p.get("relics",[]))
+                    gained_relics = new_relics - old_relics
+                    new_deck = new_p.get("deck_size", 0)
+                    new_hp = new_p.get("hp", 0)
+                    new_gold = new_p.get("gold", 0)
+                    changes = []
+                    if gained_relics:
+                        changes.append(f"Gained relic: {', '.join(gained_relics)}")
+                    if new_deck != old_deck:
+                        changes.append(f"Deck: {old_deck} → {new_deck}")
+                    if new_hp != old_hp:
+                        changes.append(f"HP: {old_hp} → {new_hp}")
+                    if new_gold != old_gold:
+                        diff = new_gold - old_gold
+                        changes.append(f"Gold: {old_gold} → {new_gold} ({'+' if diff > 0 else ''}{diff})")
+                    if changes:
+                        print(f"\n  {c('Changes:', 'yellow')} {'; '.join(changes)}")
 
             else:
                 print(f"  Unknown state: {dec}")
@@ -634,6 +690,12 @@ if __name__ == "__main__":
     parser.add_argument("--character", type=str, default="Ironclad",
                        choices=["Ironclad", "Silent", "Defect", "Regent"],
                        help="Character to play")
+    parser.add_argument("--lang", type=str, default="both",
+                       choices=["en", "zh", "both"],
+                       help="Display language: en, zh, or both")
     args = parser.parse_args()
+
+    import play as _self
+    _self.LANG = args.lang
 
     play(character=args.character, seed=args.seed, auto=args.auto)

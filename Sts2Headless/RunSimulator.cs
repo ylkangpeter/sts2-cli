@@ -1380,10 +1380,16 @@ public class RunSimulator
             ["max_hp"] = player.Creature?.MaxHp ?? 0,
             ["block"] = player.Creature?.Block ?? 0,
             ["gold"] = player.Gold,
-            ["relics"] = player.Relics?.Select(r => new Dictionary<string, object?>
+            ["relics"] = player.Relics?.Select(r =>
             {
-                ["name"] = _loc.Relic(r.Id.Entry),
-                ["description"] = _loc.Bilingual("relics", r.Id.Entry + ".description"),
+                var vars = new Dictionary<string, object?>();
+                try { foreach (var dv in r.DynamicVars.Values) vars[dv.Name] = (int)dv.BaseValue; } catch { }
+                return new Dictionary<string, object?>
+                {
+                    ["name"] = _loc.Relic(r.Id.Entry),
+                    ["description"] = _loc.Bilingual("relics", r.Id.Entry + ".description"),
+                    ["vars"] = vars.Count > 0 ? vars : null,
+                };
             }).ToList(),
             ["potions"] = player.Potions?.Select((p, i) => p == null ? null : new Dictionary<string, object?>
             {
