@@ -64,6 +64,7 @@ public class Node2D : CanvasItem
     public Vector2 Position { get; set; }
     public Vector2 GlobalPosition { get; set; }
     public float Rotation { get; set; }
+    public float RotationDegrees { get; set; }
     public Vector2 Scale { get; set; } = Vector2.One;
     public Transform2D GlobalTransform { get; set; }
     public Transform2D Transform { get; set; }

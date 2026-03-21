@@ -584,20 +584,7 @@ public class RunSimulator
         var optionIndex = Convert.ToInt32(args["option_index"]);
         Log($"Choosing option {optionIndex}");
 
-        // For events, use EventSynchronizer
-        var eventSync = RunManager.Instance.EventSynchronizer;
-        var localEvent = eventSync?.GetLocalEvent();
-        if (localEvent != null && !localEvent.IsFinished)
-        {
-            var options = localEvent.CurrentOptions;
-            if (optionIndex >= 0 && optionIndex < options.Count)
-            {
-                var option = options[optionIndex];
-                option.Chosen().GetAwaiter().GetResult();
-            }
-        }
-
-        // For rest sites — use synchronizer (handles OnSelect + option list management)
+        // Dispatch based on ROOM TYPE (not event state) to avoid cross-contamination
         if (_runState?.CurrentRoom is RestSiteRoom)
         {
             Log($"Rest site: choosing option {optionIndex}");
@@ -611,7 +598,25 @@ public class RunSimulator
                 Log($"Rest site ChooseLocalOption failed: {ex.Message}");
             }
             // Don't ForceToMap here — let DetectDecisionPoint handle it.
-            // RestSiteState will show remaining options or transition to map.
+        }
+        // For events — use EventSynchronizer
+        else if (_runState?.CurrentRoom is EventRoom)
+        {
+            var eventSync = RunManager.Instance.EventSynchronizer;
+            var localEvent = eventSync?.GetLocalEvent();
+            if (localEvent != null && !localEvent.IsFinished)
+            {
+                var options = localEvent.CurrentOptions;
+                if (optionIndex >= 0 && optionIndex < options.Count)
+                {
+                    try
+                    {
+                        options[optionIndex].Chosen().GetAwaiter().GetResult();
+                        _syncCtx.Pump();
+                    }
+                    catch (Exception ex) { Log($"Event choose: {ex.Message}"); }
+                }
+            }
         }
 
         WaitForActionExecutor();
