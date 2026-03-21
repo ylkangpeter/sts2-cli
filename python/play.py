@@ -200,7 +200,10 @@ def show_combat(state):
             elif itype in ("Debuff", "DebuffStrong", "CardDebuff", "StatusCard"):
                 intent_parts.append(c(t(f"⬇{itype}","⬇减益"), "yellow"))
             elif itype == "DeathBlow":
-                intent_parts.append(c(t("💀KILL","💀必杀"), "red"))
+                if dmg is not None:
+                    intent_parts.append(c(f"💀{dmg}", "red"))
+                else:
+                    intent_parts.append(c(t("💀KILL","💀致命一击"), "red"))
             elif itype == "Escape":
                 intent_parts.append(c(t("🏃Escape","🏃逃跑"), "dim"))
             elif itype == "Summon":
