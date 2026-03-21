@@ -12,6 +12,8 @@ using MegaCrit.Sts2.Core.Map;
 using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.Models.Characters;
 using MegaCrit.Sts2.Core.Multiplayer;
+using MegaCrit.Sts2.Core.CardSelection;
+using MegaCrit.Sts2.Core.Entities.CardRewardAlternatives;
 using MegaCrit.Sts2.Core.Entities.Merchant;
 using MegaCrit.Sts2.Core.Entities.RestSite;
 using MegaCrit.Sts2.Core.Rewards;
@@ -148,6 +150,10 @@ public class RunSimulator
             // Enter first act (generates map)
             RunManager.Instance.EnterAct(0, doTransition: false).GetAwaiter().GetResult();
             Log("Entered Act 0");
+
+            // Register headless card selector for cards that need player choice
+            // (e.g. Headbutt — pick a card from discard to put on top of draw)
+            CardSelectCmd.UseSelector(new HeadlessCardSelector());
 
             // Now we should be at the map — detect decision point
             return DetectDecisionPoint();
@@ -1237,6 +1243,29 @@ public class RunSimulator
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[WARN] Failed to patch Task.Yield: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Card selector for headless mode — picks first available card for any selection prompt.
+    /// Used by cards like Headbutt, Armaments, etc. that need player to choose a card.
+    /// </summary>
+    internal class HeadlessCardSelector : MegaCrit.Sts2.Core.TestSupport.ICardSelector
+    {
+        public Task<IEnumerable<CardModel>> GetSelectedCards(
+            IEnumerable<CardModel> options, int minSelect, int maxSelect)
+        {
+            // Pick first N cards
+            var selected = options.Take(maxSelect);
+            return Task.FromResult(selected);
+        }
+
+        public CardModel? GetSelectedCardReward(
+            IReadOnlyList<MegaCrit.Sts2.Core.Entities.Cards.CardCreationResult> options,
+            IReadOnlyList<CardRewardAlternative> alternatives)
+        {
+            // Pick first card
+            return options.Count > 0 ? options[0].Card : null;
         }
     }
 
