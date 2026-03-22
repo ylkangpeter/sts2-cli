@@ -32,7 +32,6 @@ Expected: `Completed: 5/5` for every character.
 - `Sts2Headless/Program.cs` — JSON command router
 - `GodotStubs/` — replacement GodotSharp.dll (no-op Godot types)
 - `python/play.py` — interactive terminal player
-- `python/play_full_run.py` — batch random agent
-- `python/smart_agent.py` — rule-based agent
+- `python/play_full_run.py` — batch testing tool
 - `lib/` — game DLLs (not in repo, copied by setup.sh)
 - `localization_eng/`, `localization_zhs/` — bilingual loc data

@@ -28,8 +28,6 @@ Or just run `python3 python/play.py` — it auto-detects and sets up on first ru
 ```bash
 python3 python/play.py                # interactive (Chinese)
 python3 python/play.py --lang en      # interactive (English)
-python3 python/play.py --auto         # auto-play
-python3 python/smart_agent.py 100     # run 100 games
 ```
 
 Type `help` in-game:

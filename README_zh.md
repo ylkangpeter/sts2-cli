@@ -26,8 +26,6 @@ cd sts2-cli
 ```bash
 python3 python/play.py              # 中文交互模式
 python3 python/play.py --lang en    # English
-python3 python/play.py --auto       # AI 自动打
-python3 python/smart_agent.py 100   # 跑 100 局
 ```
 
 游戏内输入 `help` 查看所有命令：
