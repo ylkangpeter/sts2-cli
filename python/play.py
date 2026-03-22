@@ -180,7 +180,7 @@ def short_n(obj):
     return str(obj)
 
 def desc(obj):
-    """Extract description, strip BBCode tags, clean template vars."""
+    """Extract description, strip BBCode tags, clean SmartFormat vars."""
     if isinstance(obj, dict) and "en" in obj:
         import re
         if LANG == "zh" and obj.get("zh"):
@@ -189,12 +189,44 @@ def desc(obj):
             text = obj["en"]
         else:
             text = obj.get("zh") or obj.get("en") or ""
-        text = re.sub(r'\[/?[^\]]+\]', '', text)  # strip [tags]
-        # Clean template vars: {Heal} → [Heal], {Damage:diff()} → [Damage]
-        def clean_var(m):
-            var = m.group(1).split(':')[0]
+        text = re.sub(r'\[/?[^\]]+\]', '', text)  # strip BBCode [tags]
+
+        # Handle SmartFormat expressions:
+        # {IfUpgraded:show:text1|text2} → text2 (non-upgraded default)
+        # {InCombat:text1|text2} → text1 (show combat version)
+        # {energyPrefix:energyIcons(1)} → [E] (energy symbol)
+        # {Stars:starIcons()} → [S] (star symbol)
+        # {VarName:diff()} → [VarName] (simple var)
+        # {VarName:choose(a|b)} → [VarName]
+
+        def smart_replace(m):
+            full = m.group(1)
+            # Handle conditional: {IfUpgraded:show:textA|textB}
+            if full.startswith("IfUpgraded:show:"):
+                parts = full[len("IfUpgraded:show:"):].split("|")
+                return parts[1] if len(parts) > 1 else parts[0]  # show non-upgraded
+            if full.startswith("IfUpgraded:"):
+                parts = full[len("IfUpgraded:"):].split("|")
+                return parts[1] if len(parts) > 1 else parts[0]
+            # {InCombat:text|alt} → show combat text
+            if full.startswith("InCombat:"):
+                parts = full[len("InCombat:"):].split("|")
+                return parts[0].lstrip("\n")  # show combat version
+            # Energy icons: {Energy:energyIcons()} → [Energy]能量
+            if "energyIcons" in full:
+                var = full.split(":")[0]
+                return f"[{var}]{t('E','能量')}"
+            # Star icons: {Stars:starIcons()} → [Stars]⭐
+            if "starIcons" in full:
+                var = full.split(":")[0]
+                return f"[{var}]⭐"
+            # Simple var with format: {Damage:diff()} → [Damage]
+            var = full.split(":")[0]
             return f"[{var}]"
-        text = re.sub(r'\{([^}]+)\}', clean_var, text)
+
+        # Process from innermost braces outward (handle nesting)
+        for _ in range(3):  # max 3 nesting levels
+            text = re.sub(r'\{([^{}]+)\}', smart_replace, text)
         return text.strip()
     return ""
 
@@ -228,19 +260,31 @@ NODE_TYPE_ZH = {"Monster": "怪物", "Elite": "精英", "Boss": "Boss", "RestSit
 
 # ─── Game display ───
 
+SPECIAL_VARS = {
+    "energyprefix": "能量" if True else "E",  # placeholder, overridden by LANG
+    "energy": "能量",
+}
+
 def resolve_template(text, vars_dict):
     """Replace [VarName] in text with actual values from vars dict.
-    Matches case-insensitively against the vars dict keys."""
-    if not vars_dict or not text:
+    Matches case-insensitively against the vars dict keys.
+    Also handles special vars like energyPrefix."""
+    if not text:
         return text
     import re
-    # Build case-insensitive lookup
-    lower_vars = {k.lower(): v for k, v in vars_dict.items()}
+    # Build case-insensitive lookup from stats + special vars
+    lower_vars = {}
+    if vars_dict:
+        lower_vars = {k.lower(): v for k, v in vars_dict.items()}
     def replacer(m):
         key = m.group(1)
-        val = lower_vars.get(key.lower())
+        kl = key.lower()
+        val = lower_vars.get(kl)
         if val is not None:
             return str(val)
+        # Special vars
+        if kl == "energyprefix":
+            return ""  # prefix only, unit already added by energyIcons handler in desc()
         return f"[{key}]"
     return re.sub(r'\[(\w+)\]', replacer, text)
 
@@ -248,7 +292,7 @@ def card_desc(card):
     """Get resolved card description using stats as template vars."""
     d = desc(card.get("description", {}))
     stats = card.get("stats") or {}
-    return resolve_template(d, stats) if stats else d
+    return resolve_template(d, stats)  # always resolve (handles energyPrefix etc.)
 
 def relic_str(r):
     """Format a relic with name and resolved description."""
