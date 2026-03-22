@@ -145,6 +145,29 @@ internal class LocLookup
     public Dictionary<string, string?> Event(string entry) => Bilingual("events", entry + ".title");
     public Dictionary<string, string?> Act(string entry) => Bilingual("acts", entry + ".title");
 
+    /// <summary>Resolve a full loc key like "TABLE.KEY.SUB" by searching all tables.</summary>
+    public Dictionary<string, string?> BilingualFromKey(string locKey)
+    {
+        // Try to find the key in any table
+        foreach (var tableName in _eng.Keys)
+        {
+            var en = _eng.GetValueOrDefault(tableName)?.GetValueOrDefault(locKey);
+            if (en != null)
+            {
+                var zh = _zhs.GetValueOrDefault(tableName)?.GetValueOrDefault(locKey);
+                return new Dictionary<string, string?> { ["en"] = en, ["zh"] = zh };
+            }
+        }
+        // Try zhs tables
+        foreach (var tableName in _zhs.Keys)
+        {
+            var zh = _zhs.GetValueOrDefault(tableName)?.GetValueOrDefault(locKey);
+            if (zh != null)
+                return new Dictionary<string, string?> { ["en"] = locKey, ["zh"] = zh };
+        }
+        return new Dictionary<string, string?> { ["en"] = locKey, ["zh"] = null };
+    }
+
     public bool IsLoaded => _eng.Count > 0;
 }
 
@@ -1105,7 +1128,8 @@ public class RunSimulator
             }
             catch { }
 
-            return new Dictionary<string, object?>
+            var starCost = c.BaseStarCost;
+            var cardInfo = new Dictionary<string, object?>
             {
                 ["index"] = i,
                 ["id"] = c.Id.ToString(),
@@ -1116,6 +1140,8 @@ public class RunSimulator
                 ["target_type"] = c.TargetType.ToString(),
                 ["stats"] = stats.Count > 0 ? stats : null,
             };
+            if (starCost > 0) cardInfo["star_cost"] = starCost;
+            return cardInfo;
         }).ToList() ?? new();
 
         var playerCreatures = combatState?.PlayerCreatures?.ToList();
@@ -1194,6 +1220,54 @@ public class RunSimulator
             ["draw_pile_count"] = pcs?.DrawPile?.Cards?.Count ?? 0,
             ["discard_pile_count"] = pcs?.DiscardPile?.Cards?.Count ?? 0,
         };
+
+        // Character-specific mechanics
+        try
+        {
+            // Defect: Orbs
+            var orbQueue = pcs?.OrbQueue;
+            if (orbQueue?.Orbs?.Count > 0)
+            {
+                result["orbs"] = orbQueue.Orbs.Select((orb, i) => new Dictionary<string, object?>
+                {
+                    ["index"] = i,
+                    ["name"] = _loc.Bilingual("orbs", orb.Id.Entry + ".title"),
+                    ["type"] = orb.GetType().Name.Replace("Orb", ""),
+                    ["passive"] = (int)orb.PassiveVal,
+                    ["evoke"] = (int)orb.EvokeVal,
+                }).ToList();
+                result["orb_slots"] = orbQueue.Capacity;
+            }
+
+            // Regent: Stars
+            if (pcs != null && pcs.Stars >= 0 && player.Character?.Id.Entry == "REGENT")
+            {
+                result["stars"] = pcs.Stars;
+            }
+
+            // Necrobinder: Osty (minion)
+            var osty = player.Osty;
+            if (osty != null)
+            {
+                result["osty"] = new Dictionary<string, object?>
+                {
+                    ["name"] = _loc.Monster(osty.Monster?.Id.Entry ?? "OSTY"),
+                    ["hp"] = osty.CurrentHp,
+                    ["max_hp"] = osty.MaxHp,
+                    ["block"] = osty.Block,
+                    ["alive"] = osty.IsAlive,
+                };
+            }
+            else if (player.Character?.Id.Entry == "NECROBINDER")
+            {
+                result["osty"] = new Dictionary<string, object?> { ["alive"] = false };
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"Character-specific data: {ex.Message}");
+        }
+
         return result;
     }
 
@@ -1349,21 +1423,99 @@ public class RunSimulator
         }
 
         var options = currentOptions
-            .Select((opt, i) => new Dictionary<string, object?>
+            .Select((opt, i) =>
             {
-                ["index"] = i,
-                ["title"] = opt.Title?.LocEntryKey ?? opt.TextKey ?? $"option_{i}",
-                ["description"] = opt.Description?.LocEntryKey ?? "",
-                ["text_key"] = opt.TextKey,
-                ["is_locked"] = opt.IsLocked,
+                // Try to resolve title via loc tables
+                Dictionary<string, string?>? title = null;
+                if (opt.Title != null)
+                {
+                    var t = _loc.Bilingual(opt.Title.LocTable, opt.Title.LocEntryKey);
+                    // Check if we actually found a translation (not just the key echoed back)
+                    if (t["en"] != null && t["en"] != opt.Title.LocEntryKey)
+                        title = t;
+                }
+                // Fallback: try to extract option ID from the key and look up as relic/card/potion
+                if (title == null && opt.TextKey != null)
+                {
+                    // TextKey like "NEOW.pages.INITIAL.options.STONE_HUMIDIFIER" → extract "STONE_HUMIDIFIER"
+                    var parts = opt.TextKey.Split('.');
+                    var optionId = parts.Length > 0 ? parts[^1] : opt.TextKey;
+                    // Try relic, then card, then just use the optionId
+                    var relic = _loc.Relic(optionId);
+                    if (relic["en"] != optionId + ".title")
+                        title = relic;
+                    else
+                    {
+                        var card = _loc.Card(optionId);
+                        if (card["en"] != optionId + ".title")
+                            title = card;
+                        else
+                            title = new Dictionary<string, string?> { ["en"] = optionId.Replace("_", " ") };
+                    }
+                }
+                title ??= new Dictionary<string, string?> { ["en"] = $"option_{i}" };
+
+                // Description: try loc table first
+                Dictionary<string, string?>? optDesc = null;
+                if (opt.Description != null && !string.IsNullOrEmpty(opt.Description.LocEntryKey))
+                {
+                    var d = _loc.Bilingual(opt.Description.LocTable, opt.Description.LocEntryKey);
+                    if (d["en"] != null && d["en"] != opt.Description.LocEntryKey)
+                        optDesc = d;
+                }
+                // Fallback: try relic/card description
+                if (optDesc == null && opt.TextKey != null)
+                {
+                    var parts = opt.TextKey.Split('.');
+                    var optionId = parts.Length > 0 ? parts[^1] : opt.TextKey;
+                    var rd = _loc.Bilingual("relics", optionId + ".description");
+                    if (rd["en"] != optionId + ".description")
+                        optDesc = rd;
+                }
+
+                // Extract vars from the relic that this option represents
+                Dictionary<string, object?>? optVars = null;
+                if (opt.TextKey != null)
+                {
+                    try
+                    {
+                        var parts = opt.TextKey.Split('.');
+                        var optionId = parts.Length > 0 ? parts[^1] : opt.TextKey;
+                        var relicModel = ModelDb.GetById<RelicModel>(new ModelId("RELIC", optionId));
+                        if (relicModel != null)
+                        {
+                            var mutable = relicModel.ToMutable();
+                            optVars = new Dictionary<string, object?>();
+                            foreach (var dv in mutable.DynamicVars.Values)
+                                optVars[dv.Name] = (int)dv.BaseValue;
+                        }
+                    }
+                    catch { }
+                }
+
+                return new Dictionary<string, object?>
+                {
+                    ["index"] = i,
+                    ["title"] = title,
+                    ["description"] = optDesc,
+                    ["text_key"] = opt.TextKey,
+                    ["is_locked"] = opt.IsLocked,
+                    ["vars"] = optVars?.Count > 0 ? optVars : null,
+                };
             }).ToList();
+
+        // Resolve event name — try ancients table first (for Neow), then events
+        var eventEntry = localEvent.Id?.Entry ?? localEvent.GetType().Name.ToUpperInvariant();
+        var eventName = _loc.Bilingual("ancients", eventEntry + ".title");
+        if (eventName["en"] == eventEntry + ".title")
+            eventName = _loc.Event(eventEntry);
 
         return new Dictionary<string, object?>
         {
             ["type"] = "decision",
             ["decision"] = "event_choice",
             ["context"] = RunContext(),
-            ["event_name"] = localEvent.GetType().Name,
+            ["event_name"] = eventName,
             ["description"] = localEvent.Description?.LocEntryKey ?? "",
             ["options"] = options,
             ["player"] = PlayerSummary(_runState!.Players[0]),
@@ -1689,6 +1841,7 @@ public class RunSimulator
             "silent" => Player.CreateForNewRun<Silent>(UnlockState.all, 1uL),
             "defect" => Player.CreateForNewRun<Defect>(UnlockState.all, 1uL),
             "regent" => Player.CreateForNewRun<Regent>(UnlockState.all, 1uL),
+            "necrobinder" => Player.CreateForNewRun<Necrobinder>(UnlockState.all, 1uL),
             _ => null
         };
     }

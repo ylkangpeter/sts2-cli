@@ -306,6 +306,35 @@ def show_combat(state):
     print(f"  {c(t(f'Round {rnd}',f'回合 {rnd}'), 'bold')}  {t('Energy','能量')}{c(f'{energy}/{max_energy}', 'cyan')}  {t('Draw','抽牌')}{draw}  {t('Discard','弃牌')}{discard}")
     show_player(state.get("player", {}))
 
+    # Character-specific: Necrobinder's Osty (show near player)
+    osty = state.get("osty")
+    if osty:
+        if osty.get("alive"):
+            ohp, omhp = osty.get("hp", 0), osty.get("max_hp", 1)
+            oblk = osty.get("block", 0)
+            print(f"    🦴 {n(osty.get('name','Osty'))}  {bar(ohp, omhp)} {ohp}/{omhp}"
+                  + (f"  {c(str(oblk), 'blue')}{t('blk','挡')}" if oblk else ""))
+        else:
+            print(f"    🦴 {c(t('Osty (dead)','Osty (已死亡)'), 'dim')}")
+
+    # Character-specific: Defect's Orbs
+    orbs = state.get("orbs")
+    if orbs:
+        orb_icons = {"Lightning": "⚡", "Frost": "❄", "Dark": "🌑", "Plasma": "🔆", "Glass": "💠"}
+        orb_parts = []
+        for orb in orbs:
+            otype = orb.get("type", "?")
+            icon = orb_icons.get(otype, "○")
+            pv, ev = orb.get("passive", 0), orb.get("evoke", 0)
+            orb_parts.append(f"{icon}{n(orb.get('name', otype))}({pv}/{ev})")
+        slots = state.get("orb_slots", len(orbs))
+        print(f"    {t('Orbs','充能球')} [{len(orbs)}/{slots}]: {' '.join(orb_parts)}")
+
+    # Character-specific: Regent's Stars
+    stars = state.get("stars")
+    if stars is not None:
+        print(f"    ⭐ {t('Stars','星辰')}: {c(str(stars), 'yellow')}")
+
     print()
     for e in state.get("enemies", []):
         hp, mhp = e.get("hp", 0), e.get("max_hp", 1)
@@ -376,7 +405,10 @@ def show_combat(state):
 
         type_color = {"Attack": "red", "Skill": "blue", "Power": "magenta", "Status": "dim", "Curse": "dim"}.get(ctype, "reset")
         mark = c("●", "green") if playable else c("○", "dim")
+        star_cost = card.get("star_cost", 0)
         cost_str = c(str(cost), "cyan")
+        if star_cost > 0:
+            cost_str += f"+{c(f'{star_cost}⭐', 'yellow')}"
 
         # Show damage/block inline only
         stats = card.get("stats") or {}
@@ -445,10 +477,9 @@ def _format_upgrade_preview(stats, aug):
         return None
     aug_stats = aug.get("stats") or {}
     parts = []
-    aug_cost = aug.get("cost")
-    # Compare all stats
+    # Compare all stats, show changed values with readable names
     all_keys = set(list(stats.keys()) + list(aug_stats.keys()))
-    for k in all_keys:
+    for k in sorted(all_keys):
         old = stats.get(k, 0)
         new_val = aug_stats.get(k, old)
         if new_val != old:
@@ -457,7 +488,8 @@ def _format_upgrade_preview(stats, aug):
             elif k == "block":
                 parts.append(c(f"{t('blk','格挡')} {old}→{new_val}", "blue"))
             else:
-                parts.append(f"{k} {old}→{new_val}")
+                # Show value change without raw key name
+                parts.append(c(f"{old}→{new_val}", "green"))
     return parts
 
 def show_card_reward(state):
@@ -592,6 +624,8 @@ def loc_resolve(key):
 def show_event(state):
     print(f"\n{'─' * 60}")
     event_name = state.get("event_name", "?")
+    # event_name is now bilingual dict {"en": ..., "zh": ...} or plain string
+    event_display = n(event_name) if isinstance(event_name, dict) else event_name
     event_desc = state.get("description", "")
     # Show context
     ctx = state.get("context", {})
@@ -599,19 +633,34 @@ def show_event(state):
         act = n(ctx.get("act_name", "?"))
         floor = ctx.get("floor", "?")
         print(f"  {c(act, 'dim')} {t('Floor','层')} {floor}")
-    print(f"  {c(f'Event: {event_name}', 'bold')}")
-    if event_desc:
-        resolved = loc_resolve(event_desc) if event_desc.isupper() or '.' in event_desc else event_desc
-        print(f"  {c(resolved, 'dim')}")
+    event_label = t("Event", "事件")
+    print(f"  {c(f'{event_label}: {event_display}', 'bold')}")
+    # event_desc is usually a raw loc key — skip it (event name already in title)
     show_player(state.get("player", {}))
     print()
     for opt in state.get("options", []):
         locked = opt.get("is_locked", False)
         mark = c("○", "dim") if locked else c("●", "green")
         raw_title = opt.get("title", opt.get("text_key", f"Option {opt['index']}"))
-        # Resolve the title from loc data
-        title = loc_resolve(raw_title) if '.' in str(raw_title) or str(raw_title).isupper() else raw_title
-        print(f"  {mark} [{opt['index']}] {title}")
+        # title is now bilingual dict or loc key string
+        if isinstance(raw_title, dict):
+            title = n(raw_title)
+        else:
+            title = loc_resolve(raw_title) if '.' in str(raw_title) or str(raw_title).isupper() else raw_title
+        # Show option description with resolved template vars
+        raw_desc = opt.get("description")
+        if isinstance(raw_desc, dict):
+            opt_desc = desc(raw_desc)
+        elif raw_desc:
+            opt_desc = loc_resolve(raw_desc) if '.' in str(raw_desc) or str(raw_desc).isupper() else raw_desc
+        else:
+            opt_desc = ""
+        # Resolve template vars like [MaxHp], [Gold]
+        opt_vars = opt.get("vars") or {}
+        if opt_vars and opt_desc:
+            opt_desc = resolve_template(opt_desc, opt_vars)
+        desc_str = f" — {c(opt_desc, 'dim')}" if opt_desc else ""
+        print(f"  {mark} [{opt['index']}] {title}{desc_str}")
 
 # ─── Input handling ───
 
@@ -1186,7 +1235,7 @@ if __name__ == "__main__":
     parser.add_argument("--auto", action="store_true", help="Auto-play with simple AI")
     parser.add_argument("--seed", type=str, default=None, help="Random seed")
     parser.add_argument("--character", type=str, default="Ironclad",
-                       choices=["Ironclad", "Silent", "Defect", "Regent"],
+                       choices=["Ironclad", "Silent", "Defect", "Regent", "Necrobinder"],
                        help="Character to play")
     parser.add_argument("--lang", type=str, default="both",
                        choices=["en", "zh", "both"],

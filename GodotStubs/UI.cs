@@ -10,6 +10,7 @@ public class CanvasItem : Node
     public virtual void Hide() => Visible = false;
     public bool IsVisibleInTree() => Visible;
     public Tween CreateTween() => new Tween();
+    public Rect2 GetViewportRect() => new Rect2(Vector2.Zero, new Vector2(1920, 1080));
 }
 
 // Control
