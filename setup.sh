@@ -140,8 +140,15 @@ var dllPath = args[0];
 Console.WriteLine($"Patching {dllPath}...");
 
 var resolver = new DefaultAssemblyResolver();
-resolver.AddSearchDirectory(Path.GetDirectoryName(dllPath)!);
-var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters { AssemblyResolver = resolver, ReadingMode = ReadingMode.Immediate });
+var libDir = Path.GetDirectoryName(dllPath)!;
+resolver.AddSearchDirectory(libDir);
+// Also search for GodotSharp.dll in the GodotStubs output (fallback)
+var stubsDir = Path.Combine(Path.GetDirectoryName(libDir)!, "GodotStubs", "bin", "Debug", "net9.0");
+if (Directory.Exists(stubsDir)) resolver.AddSearchDirectory(stubsDir);
+var module = ModuleDefinition.ReadModule(dllPath, new ReaderParameters {
+    AssemblyResolver = resolver,
+    ReadingMode = ReadingMode.Deferred  // Don't force-resolve all references upfront
+});
 
 int patches = 0;
 
