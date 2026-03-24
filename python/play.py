@@ -320,8 +320,8 @@ def show_player(p, show_deck=False):
     name = n(p.get("name", "?"))
 
     print(f"  {c(name, 'bold')}  HP {bar(hp, mhp)} {c(f'{hp}/{mhp}', 'red')}"
-          + (f"  {c(str(blk), 'blue')}{t('blk','挡')}" if blk > 0 else "")
-          + f"  {t('Gold','金')}{c(str(gold), 'yellow')}  {t('Deck','牌组')}{deck}")
+          + (f"  {c(str(blk), 'blue')} {t('blk','挡')}" if blk > 0 else "")
+          + f"  {t('Gold','金')} {c(str(gold), 'yellow')}  {t('Deck','牌组')} {deck}")
     for r in p.get("relics", []):
         print(f"    🔶 {relic_str(r)}")
     for pot in p.get("potions", []):
@@ -355,8 +355,26 @@ def show_combat(state):
     discard = state.get("discard_pile_count", 0)
 
     print(f"\n{'─' * 60}")
-    print(f"  {c(t(f'Round {rnd}',f'回合 {rnd}'), 'bold')}  {t('Energy','能量')}{c(f'{energy}/{max_energy}', 'cyan')}  {t('Draw','抽牌')}{draw}  {t('Discard','弃牌')}{discard}")
+    print(f"  {c(t(f'Round {rnd}',f'回合 {rnd}'), 'bold')}  {t('Energy','能量')} {c(f'{energy}/{max_energy}', 'cyan')}  {t('Draw','抽牌')} {draw}  {t('Discard','弃牌')} {discard}")
     show_player(state.get("player", {}))
+
+    # Player powers/buffs/debuffs
+    ppowers = state.get("player_powers") or []
+    if ppowers:
+        buffs = []
+        debuffs = []
+        for pw in ppowers:
+            amt = pw.get("amount", 0)
+            amt_str = f" {amt}" if amt and amt != 0 else ""
+            entry = f"{n(pw.get('name','?'))}{amt_str}"
+            if isinstance(amt, (int, float)) and amt < 0:
+                debuffs.append(entry)
+            else:
+                buffs.append(entry)
+        if buffs:
+            print(f"    {c(t('Buffs','增益'), 'green')}: {c(', '.join(buffs), 'green')}")
+        if debuffs:
+            print(f"    {c(t('Debuffs','减益'), 'red')}: {c(', '.join(debuffs), 'red')}")
 
     # Character-specific: Necrobinder's Osty (show near player)
     osty = state.get("osty")
@@ -440,11 +458,11 @@ def show_combat(state):
         powers = e.get("powers") or []
         power_str = ""
         if powers:
-            pw_parts = [f"{n(pw['name'])}{pw.get('amount','')}" for pw in powers]
-            power_str = "  " + c(" ".join(pw_parts), "dim")
+            pw_parts = [f"{n(pw['name'])} {pw.get('amount','')}" for pw in powers]
+            power_str = "  " + c(", ".join(pw_parts), "dim")
 
         print(f"  [{e['index']}] {n(e['name'])}  {bar(hp, mhp)} {hp}/{mhp}"
-              + (f"  {c(str(blk), 'blue')}{t('blk','挡')}" if blk else "")
+              + (f"  {c(str(blk), 'blue')} {t('blk','挡')}" if blk else "")
               + f"  {intent_str}{power_str}")
 
     print()
