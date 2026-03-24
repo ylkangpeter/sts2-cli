@@ -312,23 +312,19 @@ public class RunSimulator
                         var id = rEl.GetString();
                         if (id == null) continue;
                         var model = ModelDb.GetById<RelicModel>(new ModelId("RELIC", id));
-                        if (model != null) list.Add(model);
+                        if (model != null) list.Add(model.ToMutable());
                     }
                 }
             }
             if (args.TryGetValue("deck", out var deckEl))
             {
-                var list = GetBackingList<CardModel>(player.Deck, "_cards");
-                if (list != null)
+                player.Deck.Clear(silent: true);
+                foreach (var cEl in deckEl.EnumerateArray())
                 {
-                    list.Clear();
-                    foreach (var cEl in deckEl.EnumerateArray())
-                    {
-                        var id = cEl.GetString();
-                        if (id == null) continue;
-                        var model = ModelDb.GetById<CardModel>(new ModelId("CARD", id));
-                        if (model != null) list.Add(model);
-                    }
+                    var id = cEl.GetString();
+                    if (id == null) continue;
+                    var model = ModelDb.GetById<CardModel>(new ModelId("CARD", id));
+                    if (model != null) player.Deck.AddInternal(model.ToMutable(), silent: true);
                 }
             }
             if (args.TryGetValue("potions", out var potionsEl))
