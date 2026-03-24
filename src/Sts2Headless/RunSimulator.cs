@@ -134,9 +134,17 @@ internal class LocLookup
         return System.Text.RegularExpressions.Regex.Replace(text, @"\[/?[a-zA-Z_][a-zA-Z0-9_=]*\]", "");
     }
 
-    /// <summary>Return English string for JSON output.</summary>
+    /// <summary>Language for JSON output: "en" or "zh". Default: "en".</summary>
+    public string Lang { get; set; } = "en";
+
+    /// <summary>Return localized string for JSON output based on Lang setting.</summary>
     public string Bilingual(string table, string key)
     {
+        if (Lang == "zh")
+        {
+            var zh = _zhs.GetValueOrDefault(table)?.GetValueOrDefault(key);
+            if (zh != null) return StripBBCode(zh);
+        }
         var en = _eng.GetValueOrDefault(table)?.GetValueOrDefault(key) ?? key;
         return StripBBCode(en);
     }
@@ -153,12 +161,18 @@ internal class LocLookup
     /// <summary>Resolve a full loc key like "TABLE.KEY.SUB" by searching all tables.</summary>
     public string BilingualFromKey(string locKey)
     {
-        // Try to find the key in any table
+        if (Lang == "zh")
+        {
+            foreach (var tableName in _zhs.Keys)
+            {
+                var zh = _zhs.GetValueOrDefault(tableName)?.GetValueOrDefault(locKey);
+                if (zh != null) return zh;
+            }
+        }
         foreach (var tableName in _eng.Keys)
         {
             var en = _eng.GetValueOrDefault(tableName)?.GetValueOrDefault(locKey);
-            if (en != null)
-                return en;
+            if (en != null) return en;
         }
         return locKey;
     }
@@ -193,10 +207,11 @@ public class RunSimulator
     private IReadOnlyList<IReadOnlyList<CardModel>>? _pendingBundles;
     private TaskCompletionSource<IEnumerable<CardModel>>? _pendingBundleTcs;
 
-    public Dictionary<string, object?> StartRun(string character, int ascension = 0, string? seed = null)
+    public Dictionary<string, object?> StartRun(string character, int ascension = 0, string? seed = null, string lang = "en")
     {
         try
         {
+            _loc.Lang = lang;
             EnsureModelDbInitialized();
 
             var player = CreatePlayer(character);

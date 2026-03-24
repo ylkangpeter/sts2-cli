@@ -999,7 +999,9 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0):
         print(f"{t('Character','角色')}: {character}  {t('Seed','种子')}: {seed or t('random','随机')}{asc_str}")
         print(f"{t('Type','输入')} {c('help', 'cyan')} {t('for available commands.','查看可用命令。')}\n")
 
-        state = send({"cmd": "start_run", "character": character, "seed": seed or f"cli_{random.randint(1000,9999)}", "ascension": ascension})
+        # Map display lang to game engine lang: "both" → "zh" (show Chinese names), "en" → "en"
+        game_lang = "en" if LANG == "en" else "zh"
+        state = send({"cmd": "start_run", "character": character, "seed": seed or f"cli_{random.randint(1000,9999)}", "ascension": ascension, "lang": game_lang})
 
         while True:
             if not state:
@@ -1323,8 +1325,7 @@ if __name__ == "__main__":
                        help="Display language: en, zh, or both")
     args = parser.parse_args()
 
-    import play as _self
-    _self.LANG = args.lang
+    LANG = args.lang
 
     ensure_setup()
     play(character=args.character, seed=args.seed, auto=args.auto, ascension=args.ascension)
