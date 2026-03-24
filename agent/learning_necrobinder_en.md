@@ -56,11 +56,8 @@ Block only (p=10), Enfeebling (p=12), powers deprioritized (p=200)
 - **Strangler** (53hp): very tanky, debuffs + 12 dmg/turn
 - **Fogmog** (74hp): Eye has Illusion (first attack does 1 dmg); can't target Fogmog when Eye alive; Eye respawns; 10+ round fight drains 30+ HP
 
-## Multi-Enemy Fight Crisis
-- **#1 cause of death**: multi-enemy fights
-- Twig Slime + Flyconid: 40-60 HP loss
-- 4-slime fights: near-unwinnable with starter deck, 50+ HP loss
-- Raider combos: 30-60 combined damage, 65 to 12 HP typical
+## Multi-Enemy Crisis (#1 cause of death)
+- Slime+Flyconid: 40-60 HP loss. 4-slime: 50+ HP. Raiders: 30-60 HP.
 
 ## Kin Priest Boss (190hp + 2x58-59hp followers)
 - Followers buff Priest Str each turn — killing them is critical but they have 58+ HP
@@ -99,6 +96,3 @@ Block only (p=10), Enfeebling (p=12), powers deprioritized (p=200)
 - Poke scales with Osty HP — free 6+ dmg when Osty healthy
 - Drain Power = strongest single-target (10 dmg + draw 2)
 - Devour Life: Power Potion can offer this — heals on attack, excellent for boss
-
-## API Null Safety
-- `card["stats"]`, `option["vars"]`, card `name`/`description`/`keywords` can all be null — always guard

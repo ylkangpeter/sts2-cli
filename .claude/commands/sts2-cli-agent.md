@@ -136,8 +136,11 @@ curl -s localhost:$STS2_PORT -d '{"cmd":"get_map"}'
    - DEDUPLICATE — don't add what's already there
    - ORGANIZE by topic (Combat, Map, Card Picks, Boss, Enemy)
    - PRUNE — remove per-game logs, keep only distilled actionable insights
-   - MAX 100 LINES per file
+   - **HARD LIMIT: 100 LINES per file** — after editing, run `wc -l` to verify. If over 100, aggressively consolidate or remove lowest-value entries until under 100.
    - **Deck thinning is a key strategy** — note Exhaust/removal combos and ideal deck sizes
+   - **Bugs go in `agent/bug.md`**, NOT in learning files. Learning = strategy only.
+   - **NEVER hallucinate cards from STS1** — this is Slay the Spire 2, NOT STS1. Only reference cards/relics/enemies that you have actually SEEN in game responses. If a card name doesn't appear in the JSON, it doesn't exist. Do NOT invent card names from memory of STS1 (e.g., no Offering, Fiend Fire, Body Slam, Limit Break — these may not exist in STS2).
+   - Use official translations from `localization_zhs/` — NEVER invent Chinese names.
 3. **Report bugs**: If simulator issues found, update `agent/bug.md`.
 
 ## Cleanup
