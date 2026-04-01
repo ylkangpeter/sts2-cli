@@ -108,7 +108,39 @@ Recommended local layout:
 ```text
 workspace/
   sts2-cli/
-  st2rl/
+  sts2-rl/
+```
+
+Typical workflow:
+
+1. Initialize `sts2-cli`
+2. Start `python3 python/http_game_service.py`
+3. In the sibling `sts2-rl` repo, run regression tests or PPO training against `http://localhost:5000`
+
+## Training-Friendly Usage
+
+Set the game directory if auto-detection does not find it:
+
+```powershell
+$env:STS2_GAME_DIR="C:\path\to\SlayTheSpire2"
+```
+
+Start the service:
+
+```powershell
+python .\python\http_game_service.py
+```
+
+Regression smoke test:
+
+```powershell
+python .\python\test_http_service.py
+```
+
+Simple concurrent rollout script:
+
+```powershell
+python .\python\train_http_rl.py --threads 4 --episodes-per-thread 2
 ```
 
 ## Supported Characters
