@@ -189,12 +189,14 @@ public class RunSimulator
 {
     private RunState? _runState;
     private static bool _modelDbInitialized;
+    private static readonly int _profileId = ResolveProfileId();
     private static readonly InlineSynchronizationContext _syncCtx = new();
     private readonly ManualResetEventSlim _turnStarted = new(false);
     private readonly ManualResetEventSlim _combatEnded = new(false);
     private static readonly LocLookup _loc = new();
     private bool _eventOptionChosen;
     private int _lastEventOptionCount;
+    private bool _combatHooksRegistered;
 
     // Pending rewards for card selection (populated after combat, before proceeding)
     private List<Reward>? _pendingRewards;
@@ -245,8 +247,12 @@ public class RunSimulator
             Log("Run launched");
 
             // Register event handlers for combat turn transitions
-            CombatManager.Instance.TurnStarted += _ => _turnStarted.Set();
-            CombatManager.Instance.CombatEnded += _ => _combatEnded.Set();
+            if (!_combatHooksRegistered)
+            {
+                CombatManager.Instance.TurnStarted += _ => _turnStarted.Set();
+                CombatManager.Instance.CombatEnded += _ => _combatEnded.Set();
+                _combatHooksRegistered = true;
+            }
 
             // Finalize starting relics
             RunManager.Instance.FinalizeStartingRelics().GetAwaiter().GetResult();
@@ -279,6 +285,31 @@ public class RunSimulator
     {
         var field = obj.GetType().GetField(fieldName, NonPublic);
         return field?.GetValue(obj) as List<T>;
+    }
+
+    private static System.Collections.IList? GetPotionSlotList(Player player)
+    {
+        return GetBackingList<PotionModel>(player, "_potionSlots")
+            ?? GetBackingList<PotionModel?>(player, "_potionSlots") as System.Collections.IList;
+    }
+
+    private static (int total, int used, int free) GetPotionSlotStats(Player player)
+    {
+        var slots = GetPotionSlotList(player);
+        if (slots != null)
+        {
+            int used = 0;
+            foreach (var slot in slots)
+            {
+                if (slot != null)
+                    used++;
+            }
+            return (slots.Count, used, Math.Max(0, slots.Count - used));
+        }
+
+        var usedPotions = player.Potions?.Count(p => p != null) ?? 0;
+        var totalSlots = Math.Max(3, usedPotions);
+        return (totalSlots, usedPotions, Math.Max(0, totalSlots - usedPotions));
     }
 
     private static void SetField(object obj, string fieldName, object? value)
@@ -337,8 +368,7 @@ public class RunSimulator
             }
             if (args.TryGetValue("potions", out var potionsEl))
             {
-                var slots = GetBackingList<PotionModel>(player, "_potionSlots")
-                         ?? GetBackingList<PotionModel?>(player, "_potionSlots") as System.Collections.IList;
+                var slots = GetPotionSlotList(player);
                 if (slots != null)
                 {
                     for (int i = 0; i < slots.Count; i++) slots[i] = null;
@@ -567,12 +597,16 @@ public class RunSimulator
 
         var card = hand[cardIndex];
 
-        // Determine target based on card's TargetType first
-        // Self/None/All cards: target = null (game handles internally)
-        // AnyEnemy cards: use target_index or auto-pick first alive enemy
+        // Determine target based on card's TargetType first.
+        // Most AllEnemies cards should be played without an explicit target, but a few
+        // headless edge cases still need a fallback enemy context. We therefore try the
+        // natural no-target play first, then retry with a living enemy only if the card
+        // clearly remained unplayed.
         Creature? target = null;
         var cardTargetType = card.TargetType;
-        if (cardTargetType == TargetType.AnyEnemy)
+        var isAllEnemies = string.Equals(cardTargetType.ToString(), "AllEnemies", StringComparison.OrdinalIgnoreCase);
+        var requiresEnemyContext = cardTargetType == TargetType.AnyEnemy;
+        if (requiresEnemyContext)
         {
             // Use caller's target_index if provided
             if (args.TryGetValue("target_index", out var targetObj) && targetObj != null)
@@ -613,6 +647,25 @@ public class RunSimulator
         var handAfter = pcs.Hand.Cards;
         if (handAfter.Count == handCountBefore && cardIndex < handAfter.Count && handAfter[cardIndex] == card)
         {
+            if (isAllEnemies)
+            {
+                var fallbackState = CombatManager.Instance.DebugOnlyGetState();
+                var fallbackTarget = fallbackState?.Enemies?.FirstOrDefault(e => e != null && e.IsAlive);
+                if (fallbackTarget != null)
+                {
+                    Log($"Retrying AllEnemies card {card.GetType().Name} with fallback target context");
+                    var retryAction = new PlayCardAction(card, fallbackTarget);
+                    RunManager.Instance.ActionQueueSet.EnqueueWithoutSynchronizing(retryAction);
+                    WaitForActionExecutor();
+
+                    handAfter = pcs.Hand.Cards;
+                    if (!(handAfter.Count == handCountBefore && cardIndex < handAfter.Count && handAfter[cardIndex] == card))
+                    {
+                        return DetectDecisionPoint();
+                    }
+                }
+            }
+
             return Error($"Card could not be played (still in hand after action): {card.GetType().Name} [{card.Id}]");
         }
 
@@ -621,6 +674,8 @@ public class RunSimulator
 
     private Dictionary<string, object?> DoEndTurn(Player player)
     {
+        var beforeSnapshot = CaptureCombatSnapshot(player);
+        var skipDirectEndTurn = false;
         if (!CombatManager.Instance.IsPlayPhase)
         {
             // Might be between phases — pump and check
@@ -633,34 +688,44 @@ public class RunSimulator
                 Thread.Sleep(100);
                 _syncCtx.Pump();
                 if (!CombatManager.Instance.IsPlayPhase)
-                    return DetectDecisionPoint();
+                {
+                    // Do not return the same stuck combat state here.
+                    // Fall through into the existing recovery path so we can
+                    // cancel/retry the action executor and attempt to resume combat.
+                    skipDirectEndTurn = true;
+                    Log("EndTurn requested while combat is in-progress but not in play phase; entering recovery path");
+                }
             }
         }
 
         // Ensure no actions are still running before ending turn
         WaitForActionExecutor();
 
-        Log($"Ending turn (round={CombatManager.Instance.DebugOnlyGetState()?.RoundNumber ?? 0})");
-        _turnStarted.Reset();
-        _combatEnded.Reset();
+        if (!skipDirectEndTurn)
+        {
+            Log($"Ending turn (round={CombatManager.Instance.DebugOnlyGetState()?.RoundNumber ?? 0})");
+            _turnStarted.Reset();
+            _combatEnded.Reset();
 
-        // Enable SuppressYield so Task.Yield() runs inline during enemy turn processing.
-        // This prevents deadlocks during boss fights (e.g., Vantom) where continuations
-        // would otherwise be posted to ThreadPool and never complete.
-        YieldPatches.SuppressYield = true;
-        try
-        {
-            PlayerCmd.EndTurn(player, canBackOut: false);
-            _syncCtx.Pump();
-        }
-        finally
-        {
-            YieldPatches.SuppressYield = false;
+            // Enable SuppressYield so Task.Yield() runs inline during enemy turn processing.
+            // This prevents deadlocks during boss fights (e.g., Vantom) where continuations
+            // would otherwise be posted to ThreadPool and never complete.
+            YieldPatches.SuppressYield = true;
+            try
+            {
+                PlayerCmd.EndTurn(player, canBackOut: false);
+                _syncCtx.Pump();
+            }
+            finally
+            {
+                YieldPatches.SuppressYield = false;
+            }
         }
 
         // Fallback: if turn didn't complete synchronously, wait briefly then force retry
         if (CombatManager.Instance.IsInProgress && !CombatManager.Instance.IsPlayPhase && !player.Creature.IsDead)
         {
+            var enteredEnemyPhase = false;
             for (int i = 0; i < 50; i++)
             {
                 _syncCtx.Pump();
@@ -670,9 +735,26 @@ public class RunSimulator
                 Thread.Sleep(5);
             }
 
-            // If STILL stuck, the WaitUntilQueue TCS is likely deadlocked.
-            // Cancel the ActionExecutor to break out, then re-trigger EndTurn.
             if (CombatManager.Instance.IsInProgress && !CombatManager.Instance.IsPlayPhase && !player.Creature.IsDead)
+            {
+                var midSnapshot = CaptureCombatSnapshot(player);
+                if (beforeSnapshot != null && midSnapshot != null && !string.Equals(beforeSnapshot, midSnapshot, StringComparison.Ordinal))
+                {
+                    Log("EndTurn advanced into enemy phase; waiting for enemy turn resolution");
+                    enteredEnemyPhase = true;
+                    WaitForCombatDecisionReady();
+                    if (CombatManager.Instance.IsInProgress && !CombatManager.Instance.IsPlayPhase && !player.Creature.IsDead)
+                    {
+                        _lastKnownHp = player.Creature?.CurrentHp ?? _lastKnownHp;
+                        Log("Enemy turn failed to resolve after transition; forcing defeat state to avoid stuck combat");
+                        return GameOverState(false);
+                    }
+                }
+            }
+
+            // If STILL stuck without any state transition, the WaitUntilQueue TCS is likely deadlocked.
+            // Cancel the ActionExecutor to break out, then re-trigger EndTurn.
+            if (!enteredEnemyPhase && CombatManager.Instance.IsInProgress && !CombatManager.Instance.IsPlayPhase && !player.Creature.IsDead)
             {
                 Log("EndTurn stuck, cancelling and retrying with SuppressYield...");
                 try
@@ -711,7 +793,7 @@ public class RunSimulator
 
             // NUCLEAR OPTION: If STILL stuck after 2 attempts, use ThreadPool to force
             // the enemy turn processing to complete with SuppressYield permanently on.
-            if (CombatManager.Instance.IsInProgress && !CombatManager.Instance.IsPlayPhase && !player.Creature.IsDead)
+            if (!enteredEnemyPhase && CombatManager.Instance.IsInProgress && !CombatManager.Instance.IsPlayPhase && !player.Creature.IsDead)
             {
                 var stuckState = CombatManager.Instance.DebugOnlyGetState();
                 var stuckEnemies = stuckState?.Enemies?.Where(e => e != null && e.IsAlive)
@@ -774,7 +856,37 @@ public class RunSimulator
             }
         }
 
-        return DetectDecisionPoint();
+        SpinWaitForCombatStable();
+        WaitForCombatDecisionReady();
+
+        var decision = DetectDecisionPoint();
+        if (beforeSnapshot != null &&
+            decision.TryGetValue("decision", out var decisionNameObj) &&
+            string.Equals(decisionNameObj?.ToString(), "combat_play", StringComparison.OrdinalIgnoreCase))
+        {
+            var afterSnapshot = CaptureCombatSnapshot(player);
+            if (afterSnapshot != null && beforeSnapshot == afterSnapshot)
+            {
+                Log($"EndTurn returned identical combat snapshot; forcing retry. Snapshot={afterSnapshot}");
+                if (RetryStaleEndTurn(player, beforeSnapshot))
+                {
+                    SpinWaitForCombatStable();
+                    decision = DetectDecisionPoint();
+                    afterSnapshot = CaptureCombatSnapshot(player);
+                    if (afterSnapshot != null && beforeSnapshot == afterSnapshot)
+                    {
+                        Log($"EndTurn retry still produced identical combat snapshot. Snapshot={afterSnapshot}");
+                        return Error("EndTurn did not advance combat state");
+                    }
+                }
+                else
+                {
+                    return Error("EndTurn retry failed to advance combat state");
+                }
+            }
+        }
+
+        return decision;
     }
 
     private Dictionary<string, object?> DoSelectCardReward(Player player, Dictionary<string, object?>? args)
@@ -884,6 +996,8 @@ public class RunSimulator
         var entry = entries[idx];
         if (!entry.IsStocked) return Error("Relic already purchased");
         if (player.Gold < entry.Cost) return Error("Not enough gold");
+        var beforeGold = player.Gold;
+        var beforeRelicCount = player.Relics?.Count ?? 0;
 
         try
         {
@@ -891,7 +1005,21 @@ public class RunSimulator
             _syncCtx.Pump();
             Log($"Bought relic: {entry.Model.GetType().Name} for {entry.Cost}g");
         }
-        catch (Exception ex) { return Error($"Buy relic failed: {ex.Message}"); }
+        catch (Exception ex)
+        {
+            _syncCtx.Pump();
+            var afterRelicCount = player.Relics?.Count ?? 0;
+            var purchaseApplied = afterRelicCount > beforeRelicCount || player.Gold < beforeGold || !entry.IsStocked;
+            if (!purchaseApplied)
+            {
+                Log($"Buy relic failed: {ex.Message}");
+                return Error($"Buy relic failed: {ex.Message}");
+            }
+
+            // Some relic purchases complete in headless even if the follow-up
+            // merchant UI refresh throws a null-reference.
+            Log($"Bought relic with recoverable headless exception: {ex.Message}");
+        }
 
         return DetectDecisionPoint();
     }
@@ -910,6 +1038,11 @@ public class RunSimulator
         var entry = entries[idx];
         if (!entry.IsStocked) return Error("Potion already purchased");
         if (player.Gold < entry.Cost) return Error("Not enough gold");
+        var slotStats = GetPotionSlotStats(player);
+        if (slotStats.free <= 0) return Error("No free potion slot");
+
+        var beforeGold = player.Gold;
+        var beforeUsedSlots = slotStats.used;
 
         try
         {
@@ -919,8 +1052,17 @@ public class RunSimulator
         }
         catch (Exception ex)
         {
-            // Potion purchase sometimes NullRefs in headless (missing potion slot UI)
-            Log($"Buy potion failed: {ex.Message}");
+            _syncCtx.Pump();
+            var afterSlotStats = GetPotionSlotStats(player);
+            var purchaseApplied = afterSlotStats.used > beforeUsedSlots || player.Gold < beforeGold || !entry.IsStocked;
+            if (!purchaseApplied)
+            {
+                Log($"Buy potion failed: {ex.Message}");
+                return Error($"Buy potion failed: {ex.Message}");
+            }
+
+            // Potion purchase can still complete in headless even if a follow-up UI refresh throws.
+            Log($"Bought potion with recoverable headless exception: {ex.Message}");
         }
 
         return DetectDecisionPoint();
@@ -1049,13 +1191,14 @@ public class RunSimulator
         var potion = potionsList[idx];
         if (potion == null) return Error($"No potion at index {idx}");
 
-        // Determine target based on potion's TargetType first, then fall back to target_index
+        // Determine target based on potion's TargetType first, then fall back to target_index.
+        // Single-target player potions (including AnyPlayer in combat) must receive the
+        // player's creature explicitly or UsePotionAction will reject them with a null target.
         Creature? target = null;
         var potionTargetType = potion.TargetType;
 
-        // Self-targeting potions (Flex, Fortifier, etc.) ALWAYS target the player
-        // regardless of any target_index the caller provides
-        if (potionTargetType == TargetType.Self || potionTargetType == TargetType.TargetedNoCreature)
+        if (potionTargetType == TargetType.Self
+            || potionTargetType == TargetType.AnyPlayer)
         {
             target = player.Creature;
         }
@@ -1081,28 +1224,29 @@ public class RunSimulator
         }
         // All other target types (None, All, etc.) → leave target as null
 
-        Log($"Using potion: {potion.GetType().Name} at slot {idx} target={target?.GetType().Name ?? "none"}");
+        Log($"Using potion: {potion.GetType().Name} at slot {idx} target={target?.GetType().Name ?? "none"} targetType={potionTargetType}");
         try
         {
             var action = new MegaCrit.Sts2.Core.GameActions.UsePotionAction(potion, target, CombatManager.Instance.IsInProgress);
             RunManager.Instance.ActionQueueSet.EnqueueWithoutSynchronizing(action);
             WaitForActionExecutor();
             _syncCtx.Pump();
+            SpinWaitForCombatStable();
+            WaitForCombatDecisionReady();
+            _syncCtx.Pump();
+
             // Verify potion was consumed
             var afterPotions = player.Potions?.ToList() ?? new();
             if (afterPotions.Contains(potion))
             {
-                // Potion wasn't consumed — manually discard it
-                Log("Potion not consumed by action, manually discarding");
-                MegaCrit.Sts2.Core.Commands.PotionCmd.Discard(potion).GetAwaiter().GetResult();
-                _syncCtx.Pump();
+                Log("Potion action completed without consuming potion");
+                return Error("Potion action did not resolve");
             }
         }
         catch (Exception ex)
         {
             Log($"Use potion failed: {ex.Message}");
-            // Try manual discard as fallback
-            try { MegaCrit.Sts2.Core.Commands.PotionCmd.Discard(potion).GetAwaiter().GetResult(); } catch { }
+            return Error($"Use potion failed: {ex.Message}");
         }
 
         return DetectDecisionPoint();
@@ -1274,18 +1418,9 @@ public class RunSimulator
 
     #region Decision Point Detection
 
-    private Dictionary<string, object?> DetectDecisionPoint()
+    private bool TryGetPendingDecision(Player player, out Dictionary<string, object?> decision)
     {
-        if (_runState == null)
-            return Error("No run in progress");
-
-        var player = _runState.Players[0];
-
-        // Check game over (death)
-        if (player.Creature != null && player.Creature.IsDead)
-        {
-            return GameOverState(false);
-        }
+        decision = null!;
 
         // Check if there's a pending bundle selection (Scroll Boxes: pick 1 of N packs)
         if (_pendingBundles != null && _pendingBundleTcs != null && !_pendingBundleTcs.Task.IsCompleted)
@@ -1308,7 +1443,7 @@ public class RunSimulator
                 }).ToList(),
             }).ToList();
 
-            return new Dictionary<string, object?>
+            decision = new Dictionary<string, object?>
             {
                 ["type"] = "decision",
                 ["decision"] = "bundle_select",
@@ -1316,6 +1451,7 @@ public class RunSimulator
                 ["bundles"] = bundles,
                 ["player"] = PlayerSummary(player),
             };
+            return true;
         }
 
         // Check if there's a pending card reward from event (GetSelectedCardReward blocking)
@@ -1340,7 +1476,7 @@ public class RunSimulator
                 };
             }).ToList();
 
-            return new Dictionary<string, object?>
+            decision = new Dictionary<string, object?>
             {
                 ["type"] = "decision",
                 ["decision"] = "card_reward",
@@ -1350,10 +1486,10 @@ public class RunSimulator
                 ["from_event"] = true,
                 ["player"] = PlayerSummary(_runState!.Players[0]),
             };
+            return true;
         }
 
         // Check if there's a pending card selection (upgrade, remove, transform, start-of-turn powers)
-        checkCardSelect:
         if (_cardSelector.HasPending && _cardSelector.PendingOptions != null)
         {
             var opts = _cardSelector.PendingOptions.Select((card, i) =>
@@ -1374,7 +1510,7 @@ public class RunSimulator
                 };
             }).ToList();
 
-            return new Dictionary<string, object?>
+            decision = new Dictionary<string, object?>
             {
                 ["type"] = "decision",
                 ["decision"] = "card_select",
@@ -1384,19 +1520,41 @@ public class RunSimulator
                 ["max_select"] = _cardSelector.PendingMaxSelect,
                 ["player"] = PlayerSummary(player),
             };
+            return true;
         }
 
         // Check if there's a pending card reward
         if (_pendingCardReward != null)
         {
-            return CardRewardState(player, _runState.CurrentRoom as CombatRoom);
+            decision = CardRewardState(player, _runState.CurrentRoom as CombatRoom);
+            return true;
         }
 
         // Check if RunManager reports game over
         if (RunManager.Instance.IsGameOver)
         {
-            return GameOverState(true);
+            decision = GameOverState(true);
+            return true;
         }
+
+        return false;
+    }
+
+    private Dictionary<string, object?> DetectDecisionPoint()
+    {
+        if (_runState == null)
+            return Error("No run in progress");
+
+        var player = _runState.Players[0];
+
+        // Check game over (death)
+        if (player.Creature != null && player.Creature.IsDead)
+        {
+            return GameOverState(false);
+        }
+
+        if (TryGetPendingDecision(player, out var pendingDecision))
+            return pendingDecision;
 
         var room = _runState.CurrentRoom;
 
@@ -1412,13 +1570,12 @@ public class RunSimulator
             // With Task.Yield() patched, combat init should be synchronous
             _syncCtx.Pump();
             WaitForActionExecutor();
+            WaitForCombatDecisionReady();
 
             // Re-check for pending card selections AFTER pump (BUG-024: start-of-turn effects
             // like Tools of Trade create card selections during Pump, AFTER the initial HasPending check)
-            if (_cardSelector.HasPending && _cardSelector.PendingOptions != null)
-            {
-                goto checkCardSelect;  // Jump back to card_select handling
-            }
+            if (TryGetPendingDecision(player, out var combatPendingDecision))
+                return combatPendingDecision;
 
             if (CombatManager.Instance.IsInProgress && CombatManager.Instance.IsPlayPhase)
             {
@@ -1428,15 +1585,16 @@ public class RunSimulator
             {
                 return DetectPostCombatState(player, combatRoom);
             }
-            // Fallback: brief wait
-            for (int i = 0; i < 20; i++)
+            // Fallback: wait longer for enemy turn resolution before exposing combat_play again.
+            for (int i = 0; i < 200; i++)
             {
                 _syncCtx.Pump();
+                WaitForActionExecutor();
                 Thread.Sleep(5);
                 if (CombatManager.Instance.IsPlayPhase) return CombatPlayState(player);
                 if (!CombatManager.Instance.IsInProgress) return DetectPostCombatState(player, combatRoom);
             }
-            return CombatPlayState(player);
+            return Error("Combat is still resolving enemy turn");
         }
 
         // Event room
@@ -2152,6 +2310,7 @@ public class RunSimulator
     {
         // Treasure rooms give relics via TreasureRoomRelicSynchronizer
         Log("Treasure room — collecting rewards");
+        var player = _runState!.Players[0];
 
         // BUG-013: Ensure any pending relic picking session is complete before starting new one
         WaitForActionExecutor();
@@ -2181,6 +2340,27 @@ public class RunSimulator
         }
         catch (Exception ex) { Log($"Treasure rewards: {ex.Message}"); }
 
+        // Treasure resolution can trigger follow-up choice states asynchronously.
+        // Do not force the room back to the map until those pending decisions have surfaced
+        // or the room has actually transitioned away from TreasureRoom.
+        for (int i = 0; i < 40; i++)
+        {
+            _syncCtx.Pump();
+            WaitForActionExecutor();
+
+            if (TryGetPendingDecision(player, out var pendingDecision))
+                return pendingDecision;
+
+            var currentRoom = _runState?.CurrentRoom;
+            if (currentRoom == null || currentRoom is MapRoom)
+                return MapSelectState();
+            if (currentRoom is not TreasureRoom)
+                return DetectDecisionPoint();
+
+            Thread.Sleep(5);
+        }
+
+        Log("Treasure room did not settle after rewards; forcing map as fallback");
         ForceToMap();
         return MapSelectState();
     }
@@ -2251,6 +2431,131 @@ public class RunSimulator
         }
     }
 
+    private void WaitForCombatDecisionReady()
+    {
+        if (!CombatManager.Instance.IsInProgress)
+            return;
+        if (CombatManager.Instance.IsPlayPhase)
+            return;
+
+        for (int i = 0; i < 800; i++)
+        {
+            _syncCtx.Pump();
+            WaitForActionExecutor();
+            if (!CombatManager.Instance.IsInProgress)
+                return;
+            if (CombatManager.Instance.IsPlayPhase)
+                return;
+            Thread.Sleep(5);
+        }
+    }
+
+    private string? CaptureCombatSnapshot(Player player)
+    {
+        try
+        {
+            var combatState = CombatManager.Instance.DebugOnlyGetState();
+            var pcs = player.PlayerCombatState;
+            if (combatState == null || pcs == null)
+                return null;
+
+            var enemies = combatState.Enemies?
+                .Where(e => e != null)
+                .Select((enemy, index) =>
+                {
+                    var powers = enemy!.Powers?
+                        .Select(p => $"{p.Id.Entry}:{p.Amount}")
+                        .OrderBy(x => x)
+                        .ToArray() ?? Array.Empty<string>();
+                    return $"{index}:{enemy.Monster?.GetType().Name}:{enemy.CurrentHp}:{enemy.Block}:{enemy.IsAlive}:{string.Join("|", powers)}";
+                })
+                .ToArray() ?? Array.Empty<string>();
+
+            var hand = pcs.Hand?.Cards?
+                .Select(card => $"{card.Id.Entry}:{card.EnergyCost?.GetResolved() ?? 0}:{card.CanPlay(out _, out _)}")
+                .ToArray() ?? Array.Empty<string>();
+
+            var playerPowers = player.Creature?.Powers?
+                .Select(p => $"{p.Id.Entry}:{p.Amount}")
+                .OrderBy(x => x)
+                .ToArray() ?? Array.Empty<string>();
+
+            return string.Join("::",
+                CombatManager.Instance.IsInProgress,
+                CombatManager.Instance.IsPlayPhase,
+                player.Creature?.IsDead ?? false,
+                player.Creature?.CurrentHp ?? 0,
+                player.Creature?.Block ?? 0,
+                combatState.RoundNumber,
+                pcs.Energy,
+                pcs.Hand?.Cards?.Count ?? 0,
+                pcs.DrawPile?.Cards?.Count ?? 0,
+                pcs.DiscardPile?.Cards?.Count ?? 0,
+                pcs.ExhaustPile?.Cards?.Count ?? 0,
+                string.Join(",", hand),
+                string.Join(",", enemies),
+                string.Join(",", playerPowers));
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private bool RetryStaleEndTurn(Player player, string baselineSnapshot)
+    {
+        try
+        {
+            try
+            {
+                RunManager.Instance.ActionExecutor.Cancel();
+            }
+            catch { }
+
+            _syncCtx.Pump();
+            Thread.Sleep(25);
+            _syncCtx.Pump();
+
+            try
+            {
+                CombatManager.Instance.UndoReadyToEndTurn(player);
+            }
+            catch { }
+
+            _turnStarted.Reset();
+            _combatEnded.Reset();
+
+            YieldPatches.SuppressYield = true;
+            try
+            {
+                PlayerCmd.EndTurn(player, canBackOut: false);
+                _syncCtx.Pump();
+            }
+            finally
+            {
+                YieldPatches.SuppressYield = false;
+            }
+
+            for (int i = 0; i < 200; i++)
+            {
+                _syncCtx.Pump();
+                WaitForActionExecutor();
+                var currentSnapshot = CaptureCombatSnapshot(player);
+                if (currentSnapshot == null || currentSnapshot != baselineSnapshot)
+                    return true;
+                if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead)
+                    return true;
+                Thread.Sleep(5);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"RetryStaleEndTurn error: {ex.Message}");
+        }
+
+        return false;
+    }
+
     /// <summary>Compute what a card would look like after upgrading (stats + cost + description).</summary>
     private Dictionary<string, object?>? GetUpgradedInfo(CardModel card)
     {
@@ -2291,6 +2596,7 @@ public class RunSimulator
 
     private Dictionary<string, object?> PlayerSummary(Player player)
     {
+        var potionSlotStats = GetPotionSlotStats(player);
         return new Dictionary<string, object?>
         {
             ["name"] = _loc.Bilingual("characters", (player.Character?.Id.Entry ?? "IRONCLAD") + ".title"),
@@ -2317,12 +2623,16 @@ public class RunSimulator
                 return new Dictionary<string, object?>
                 {
                     ["index"] = i,
+                    ["id"] = p.Id.Entry,
                     ["name"] = _loc.Potion(p.Id.Entry),
                     ["description"] = _loc.Bilingual("potions", p.Id.Entry + ".description"),
                     ["vars"] = pvars.Count > 0 ? pvars : null,
                     ["target_type"] = p.TargetType.ToString(),
                 };
             }).Where(x => x != null).ToList(),
+            ["potion_slots_total"] = potionSlotStats.total,
+            ["potion_slots_used"] = potionSlotStats.used,
+            ["potion_slots_free"] = potionSlotStats.free,
             ["deck_size"] = player.Deck?.Cards?.Count(c => c != null) ?? 0,
             ["deck"] = player.Deck?.Cards?.Where(c => c != null).Select(c =>
             {
@@ -2400,9 +2710,14 @@ public class RunSimulator
             Console.Error.WriteLine($"[WARN] PlatformUtil init: {ex.Message}");
         }
 
-        // Initialize SaveManager with a dummy profile for save/load support
-        try { SaveManager.Instance.InitProfileId(0); }
-        catch (Exception ex) { Console.Error.WriteLine($"[WARN] SaveManager.InitProfileId: {ex.Message}"); }
+        // Initialize SaveManager with the configured profile so real progress data can participate
+        // in run initialization and seed-adjacent game setup.
+        try
+        {
+            SaveManager.Instance.InitProfileId(_profileId);
+            Console.Error.WriteLine($"[INFO] SaveManager profile initialized: profile{_profileId}");
+        }
+        catch (Exception ex) { Console.Error.WriteLine($"[WARN] SaveManager.InitProfileId(profile{_profileId}): {ex.Message}"); }
 
         // Initialize progress data for epoch/timeline tracking
         try { SaveManager.Instance.InitProgressData(); }
@@ -2450,6 +2765,12 @@ public class RunSimulator
         {
             Console.Error.WriteLine($"[WARN] ModelIdSerializationCache.Init: {ex.Message}");
         }
+    }
+
+    private static int ResolveProfileId()
+    {
+        var raw = Environment.GetEnvironmentVariable("STS2_PROFILE_ID");
+        return int.TryParse(raw, out var parsed) && parsed >= 0 ? parsed : 0;
     }
 
     private Player? CreatePlayer(string characterName)
@@ -3153,6 +3474,23 @@ public class RunSimulator
     {
         try
         {
+            try { CombatManager.Instance.TurnStarted -= _ => _turnStarted.Set(); } catch { }
+            try { CombatManager.Instance.CombatEnded -= _ => _combatEnded.Set(); } catch { }
+            try { RunManager.Instance.ActionExecutor.Cancel(); } catch { }
+            try { _cardSelector.CancelPending(); } catch { }
+            try { if (_cardSelector.HasPendingReward) _cardSelector.SkipReward(); } catch { }
+            try { _pendingBundleTcs?.TrySetResult(Array.Empty<CardModel>()); } catch { }
+            _pendingBundles = null;
+            _pendingBundleTcs = null;
+            _pendingRewards = null;
+            _pendingCardReward = null;
+            _rewardsProcessed = false;
+            _eventOptionChosen = false;
+            _lastEventOptionCount = 0;
+            _goldBeforeCombat = 0;
+            _lastKnownHp = 0;
+            _turnStarted.Reset();
+            _combatEnded.Reset();
             if (RunManager.Instance.IsInProgress)
                 RunManager.Instance.CleanUp(graceful: true);
             _runState = null;

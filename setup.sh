@@ -16,25 +16,31 @@ set -e
 GAME_DIR="$1"
 
 if [ -z "$GAME_DIR" ]; then
-    # Auto-detect based on platform
-    case "$(uname -s)" in
-        Darwin)
-            GAME_DIR="$HOME/Library/Application Support/Steam/steamapps/common/Slay the Spire 2/SlayTheSpire2.app/Contents/Resources/data_sts2_macos_arm64"
-            if [ ! -d "$GAME_DIR" ]; then
-                # Try x86_64
-                GAME_DIR="$HOME/Library/Application Support/Steam/steamapps/common/Slay the Spire 2/SlayTheSpire2.app/Contents/Resources/data_sts2_macos_x86_64"
-            fi
-            ;;
-        Linux)
-            GAME_DIR="$HOME/.steam/steam/steamapps/common/Slay the Spire 2"
-            if [ ! -d "$GAME_DIR" ]; then
-                GAME_DIR="$HOME/.local/share/Steam/steamapps/common/Slay the Spire 2"
-            fi
-            ;;
-        MINGW*|MSYS*|CYGWIN*)
-            GAME_DIR="C:/Program Files (x86)/Steam/steamapps/common/Slay the Spire 2"
-            ;;
-    esac
+    # Check for STS2_GAME_DIR environment variable
+    if [ -n "$STS2_GAME_DIR" ]; then
+        GAME_DIR="$STS2_GAME_DIR"
+        echo "📁 Using game directory from environment variable: $GAME_DIR"
+    else
+        # Auto-detect based on platform
+        case "$(uname -s)" in
+            Darwin)
+                GAME_DIR="$HOME/Library/Application Support/Steam/steamapps/common/Slay the Spire 2/SlayTheSpire2.app/Contents/Resources/data_sts2_macos_arm64"
+                if [ ! -d "$GAME_DIR" ]; then
+                    # Try x86_64
+                    GAME_DIR="$HOME/Library/Application Support/Steam/steamapps/common/Slay the Spire 2/SlayTheSpire2.app/Contents/Resources/data_sts2_macos_x86_64"
+                fi
+                ;;
+            Linux)
+                GAME_DIR="$HOME/.steam/steam/steamapps/common/Slay the Spire 2"
+                if [ ! -d "$GAME_DIR" ]; then
+                    GAME_DIR="$HOME/.local/share/Steam/steamapps/common/Slay the Spire 2"
+                fi
+                ;;
+            MINGW*|MSYS*|CYGWIN*)
+                GAME_DIR="C:/Program Files (x86)/Steam/steamapps/common/Slay the Spire 2"
+                ;;
+        esac
+    fi
 fi
 
 if [ ! -d "$GAME_DIR" ]; then

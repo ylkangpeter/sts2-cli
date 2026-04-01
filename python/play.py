@@ -40,10 +40,32 @@ def _find_dotnet():
 DOTNET = _find_dotnet()
 
 
-def _find_game_dir():
+def _find_game_dir(custom_dir=None):
     """Auto-detect STS2 Steam install directory."""
     import platform
     system = platform.system()
+    
+    # 如果提供了自定义目录，直接使用
+    if custom_dir:
+        # 自动检测游戏目录的子目录结构
+        potential_subdirs = [
+            "data_sts2_windows_x86_64",
+            "data_sts2_macos_arm64",
+            "data_sts2_linux_x86_64"
+        ]
+        game_dir_to_use = custom_dir
+        for subdir in potential_subdirs:
+            test_dir = os.path.join(custom_dir, subdir)
+            if os.path.exists(test_dir) and os.path.isdir(test_dir):
+                game_dir_to_use = test_dir
+                break
+        if os.path.isdir(game_dir_to_use):
+            return game_dir_to_use
+        else:
+            print(f"❌ 指定的游戏目录不存在: {custom_dir}")
+            return None
+    
+    # 自动检测逻辑
     candidates = []
     if system == "Darwin":
         base = os.path.expanduser("~/Library/Application Support/Steam/steamapps/common/Slay the Spire 2/SlayTheSpire2.app/Contents/Resources")
@@ -113,7 +135,7 @@ def _build():
     return r.returncode == 0
 
 
-def ensure_setup():
+def ensure_setup(game_dir=None):
     """Check that everything is ready to run. Auto-setup if needed."""
     issues = []
 
@@ -127,7 +149,7 @@ def ensure_setup():
     sts2_dll = os.path.join(LIB_DIR, "sts2.dll")
     if not os.path.isfile(sts2_dll):
         print("📦 Game DLLs not found. Running first-time setup...")
-        game_dir = _find_game_dir()
+        game_dir = _find_game_dir(game_dir)
         if not game_dir:
             print("❌ Could not find Slay the Spire 2 installation.")
             print("   Install the game via Steam, then run again.")
@@ -140,7 +162,7 @@ def ensure_setup():
             sys.exit(1)
 
     # Set STS2_GAME_DIR env var for runtime DLL resolution
-    game_dir = _find_game_dir()
+    game_dir = _find_game_dir(game_dir)
     if game_dir:
         os.environ["STS2_GAME_DIR"] = game_dir
 
@@ -1179,7 +1201,11 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True):
                         if len(enemies) == 1:
                             args["target_index"] = enemies[0]["index"]
                         elif auto:
-                            args["target_index"] = min(enemies, key=lambda e: e.get("hp", 999))["index"]
+                            if enemies:
+                                args["target_index"] = min(enemies, key=lambda e: e.get("hp", 999))["index"]
+                            else:
+                                # No enemies, skip card
+                                continue
                         else:
                             tgt = get_input("Target enemy [index]",
                                            {str(e["index"]) for e in enemies})
@@ -1427,9 +1453,11 @@ if __name__ == "__main__":
                        help="Display language: en or zh (default: zh)")
     parser.add_argument("--no-log", action="store_true",
                        help="Disable game logging")
+    parser.add_argument("--game-dir", type=str, default=None,
+                       help="Path to Slay the Spire 2 game directory")
     args = parser.parse_args()
 
     LANG = args.lang
 
-    ensure_setup()
+    ensure_setup(game_dir=args.game_dir)
     play(character=args.character, seed=args.seed, auto=args.auto, ascension=args.ascension, log=not args.no_log)

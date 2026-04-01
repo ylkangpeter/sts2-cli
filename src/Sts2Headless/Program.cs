@@ -146,6 +146,10 @@ class Program
                 sim.CleanUp();
                 return null;
 
+            case "cleanup":
+                sim.CleanUp();
+                return new Dictionary<string, object?> { ["type"] = "ok", ["message"] = "cleanup complete" };
+
             default:
                 return new Dictionary<string, object?> { ["type"] = "error", ["message"] = $"Unknown command: {cmdType}" };
         }
