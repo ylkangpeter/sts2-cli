@@ -312,6 +312,241 @@ public class RunSimulator
         return (totalSlots, usedPotions, Math.Max(0, totalSlots - usedPotions));
     }
 
+    private static readonly string[] PotionUtilityTokens =
+    {
+        "draw", "energy", "strength", "dexterity", "artifact", "block", "heal", "vulnerable",
+        "weak", "frail", "poison", "stun", "retain", "upgrade", "revive",
+        "抽牌", "能量", "力量", "敏捷", "人工制品", "格挡", "恢复", "易伤",
+        "虚弱", "脆弱", "中毒", "眩晕", "保留", "升级", "复活"
+    };
+
+    private static object? GetMemberValue(object? obj, params string[] memberNames)
+    {
+        if (obj == null) return null;
+        var type = obj.GetType();
+        const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+        foreach (var memberName in memberNames)
+        {
+            var prop = type.GetProperty(memberName, flags);
+            if (prop != null)
+            {
+                try { return prop.GetValue(obj); } catch { }
+            }
+
+            var field = type.GetField(memberName, flags);
+            if (field != null)
+            {
+                try { return field.GetValue(obj); } catch { }
+            }
+        }
+
+        return null;
+    }
+
+    private static string? TryGetIdEntry(object? obj)
+    {
+        if (obj == null) return null;
+        if (obj is ModelId modelId)
+            return modelId.Entry;
+
+        var idObj = GetMemberValue(obj, "Id", "_id", "ModelId");
+        if (idObj is ModelId typedId)
+            return typedId.Entry;
+
+        var entry = GetMemberValue(idObj, "Entry", "_entry") as string;
+        if (!string.IsNullOrWhiteSpace(entry))
+            return entry;
+
+        return GetMemberValue(obj, "Entry", "_entry") as string;
+    }
+
+    private string PotionDescription(string? entry)
+    {
+        if (string.IsNullOrWhiteSpace(entry)) return "";
+        return _loc.Bilingual("potions", entry + ".description");
+    }
+
+    private string PotionName(string? entry)
+    {
+        if (string.IsNullOrWhiteSpace(entry)) return "?";
+        return _loc.Potion(entry);
+    }
+
+    private Dictionary<string, object?> DescribePotion(PotionModel potion, int index)
+    {
+        var vars = new Dictionary<string, object?>();
+        try
+        {
+            foreach (var dv in potion.DynamicVars.Values)
+                vars[dv.Name] = (int)dv.BaseValue;
+        }
+        catch { }
+
+        var rarity = GetMemberValue(potion, "Rarity", "_rarity")?.ToString();
+        return new Dictionary<string, object?>
+        {
+            ["index"] = index,
+            ["id"] = potion.Id.Entry,
+            ["name"] = PotionName(potion.Id.Entry),
+            ["description"] = PotionDescription(potion.Id.Entry),
+            ["vars"] = vars.Count > 0 ? vars : null,
+            ["target_type"] = potion.TargetType.ToString(),
+            ["rarity"] = rarity,
+        };
+    }
+
+    private Dictionary<string, object?>? DescribeRewardPotion(Reward reward)
+    {
+        var candidate = GetMemberValue(reward, "Potion", "_potion", "Model", "_model", "PotionModel") as PotionModel;
+        var entry = candidate?.Id.Entry ?? TryGetIdEntry(candidate);
+        if (string.IsNullOrWhiteSpace(entry))
+        {
+            var idCarrier = GetMemberValue(reward, "Potion", "_potion", "Model", "_model", "PotionModel", "Item", "_item");
+            entry = TryGetIdEntry(idCarrier);
+        }
+
+        if (string.IsNullOrWhiteSpace(entry))
+            return null;
+
+        var targetType = candidate?.TargetType.ToString() ?? GetMemberValue(reward, "TargetType", "_targetType")?.ToString() ?? "";
+        var rarity = GetMemberValue(candidate, "Rarity", "_rarity")
+            ?? GetMemberValue(reward, "Rarity", "_rarity");
+
+        return new Dictionary<string, object?>
+        {
+            ["id"] = entry,
+            ["name"] = PotionName(entry),
+            ["description"] = PotionDescription(entry),
+            ["target_type"] = targetType,
+            ["rarity"] = rarity?.ToString(),
+        };
+    }
+
+    private static double RarityScore(string? rarity)
+    {
+        if (string.IsNullOrWhiteSpace(rarity)) return 1.0;
+        return rarity.Trim().ToLowerInvariant() switch
+        {
+            "token" => 5.5,
+            "ancient" => 5.5,
+            "rare" => 4.5,
+            "uncommon" => 3.0,
+            "common" => 2.0,
+            "basic" => 1.0,
+            _ => 1.0,
+        };
+    }
+
+    private static double EstimatePotionScore(Dictionary<string, object?> potion)
+    {
+        var description = Convert.ToString(potion.GetValueOrDefault("description")) ?? "";
+        var targetType = Convert.ToString(potion.GetValueOrDefault("target_type")) ?? "";
+        var rarity = Convert.ToString(potion.GetValueOrDefault("rarity"));
+        var score = 1.0 + RarityScore(rarity) * 0.6;
+
+        foreach (var token in PotionUtilityTokens)
+        {
+            if (description.Contains(token, StringComparison.OrdinalIgnoreCase))
+                score += 0.35;
+        }
+
+        if (targetType.Contains("enemy", StringComparison.OrdinalIgnoreCase))
+            score += 0.5;
+
+        return score;
+    }
+
+    private Dictionary<string, object?>? WorstOwnedPotion(Player player)
+    {
+        Dictionary<string, object?>? worst = null;
+        var potions = player.Potions ?? Array.Empty<PotionModel?>();
+        foreach (var potion in potions.Select((p, i) => (p, i)))
+        {
+            if (potion.p == null) continue;
+            var info = DescribePotion(potion.p, potion.i);
+            if (worst == null || EstimatePotionScore(info) < EstimatePotionScore(worst))
+                worst = info;
+        }
+
+        return worst;
+    }
+
+    private bool TrySelectReward(Reward reward, string label)
+    {
+        try
+        {
+            reward.OnSelectWrapper().GetAwaiter().GetResult();
+            _syncCtx.Pump();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log($"{label}: {ex.Message}");
+            return false;
+        }
+    }
+
+    private void AutoCollectCombatReward(Player player, Reward reward)
+    {
+        if (reward is GoldReward || reward is MegaCrit.Sts2.Core.Rewards.RelicReward)
+        {
+            TrySelectReward(reward, "Auto-collect reward");
+            return;
+        }
+
+        if (reward is not MegaCrit.Sts2.Core.Rewards.PotionReward)
+            return;
+
+        var slotStats = GetPotionSlotStats(player);
+        if (slotStats.free > 0)
+        {
+            TrySelectReward(reward, "Auto-collect reward");
+            return;
+        }
+
+        var candidate = DescribeRewardPotion(reward);
+        var worstOwned = WorstOwnedPotion(player);
+        if (candidate == null || worstOwned == null)
+        {
+            Log("Skipping potion reward: unable to score replacement");
+            return;
+        }
+
+        var candidateScore = EstimatePotionScore(candidate);
+        var worstScore = EstimatePotionScore(worstOwned);
+        if (candidateScore <= worstScore + 0.75)
+        {
+            Log($"Skipping potion reward: candidate {candidate.GetValueOrDefault("id")} score={candidateScore:F2} <= held {worstOwned.GetValueOrDefault("id")} score={worstScore:F2}");
+            return;
+        }
+
+        if (TrySelectReward(reward, "Auto-collect reward"))
+            return;
+
+        var worstIndex = Convert.ToInt32(worstOwned["index"]);
+        var worstPotion = player.Potions?.ElementAtOrDefault(worstIndex);
+        if (worstPotion == null)
+        {
+            Log("Skipping potion reward: replacement target vanished before discard");
+            return;
+        }
+
+        try
+        {
+            Log($"Replacing potion slot {worstIndex}: drop {worstOwned.GetValueOrDefault("id")} for {candidate.GetValueOrDefault("id")}");
+            MegaCrit.Sts2.Core.Commands.PotionCmd.Discard(worstPotion).GetAwaiter().GetResult();
+            _syncCtx.Pump();
+        }
+        catch (Exception ex)
+        {
+            Log($"Discard before potion reward failed: {ex.Message}");
+            return;
+        }
+
+        if (!TrySelectReward(reward, "Auto-collect reward after discard"))
+            Log($"Potion reward still failed after discard for {candidate.GetValueOrDefault("id")}");
+    }
+
     private static void SetField(object obj, string fieldName, object? value)
     {
         var field = obj.GetType().GetField(fieldName, NonPublic);
@@ -970,14 +1205,25 @@ public class RunSimulator
         var entry = allEntries[idx];
         if (!entry.IsStocked) return Error("Card already purchased");
         if (player.Gold < entry.Cost) return Error("Not enough gold");
+        var beforeGold = player.Gold;
 
         try
         {
-            entry.OnTryPurchaseWrapper(merchantRoom.Inventory).GetAwaiter().GetResult();
+            var task = Task.Run(() => entry.OnTryPurchaseWrapper(merchantRoom.Inventory));
+            WaitForMerchantAction(task, () => player.Gold < beforeGold || !entry.IsStocked);
+            if (!task.IsCompleted) task.Wait(2000);
+            task.GetAwaiter().GetResult();
             _syncCtx.Pump();
             Log($"Bought card: {entry.CreationResult?.Card?.GetType().Name ?? "?"} for {entry.Cost}g");
         }
-        catch (Exception ex) { return Error($"Buy card failed: {ex.Message}"); }
+        catch (Exception ex)
+        {
+            _syncCtx.Pump();
+            var purchaseApplied = player.Gold < beforeGold || !entry.IsStocked;
+            if (!purchaseApplied)
+                return Error($"Buy card failed: {ex.Message}");
+            Log($"Bought card with recoverable headless exception: {ex.Message}");
+        }
 
         return DetectDecisionPoint();
     }
@@ -1001,7 +1247,14 @@ public class RunSimulator
 
         try
         {
-            entry.OnTryPurchaseWrapper(merchantRoom.Inventory).GetAwaiter().GetResult();
+            var task = Task.Run(() => entry.OnTryPurchaseWrapper(merchantRoom.Inventory));
+            WaitForMerchantAction(task, () =>
+            {
+                var afterRelicCount = player.Relics?.Count ?? 0;
+                return afterRelicCount > beforeRelicCount || player.Gold < beforeGold || !entry.IsStocked;
+            });
+            if (!task.IsCompleted) task.Wait(2000);
+            task.GetAwaiter().GetResult();
             _syncCtx.Pump();
             Log($"Bought relic: {entry.Model.GetType().Name} for {entry.Cost}g");
         }
@@ -1046,7 +1299,14 @@ public class RunSimulator
 
         try
         {
-            entry.OnTryPurchaseWrapper(merchantRoom.Inventory).GetAwaiter().GetResult();
+            var task = Task.Run(() => entry.OnTryPurchaseWrapper(merchantRoom.Inventory));
+            WaitForMerchantAction(task, () =>
+            {
+                var afterSlotStats = GetPotionSlotStats(player);
+                return afterSlotStats.used > beforeUsedSlots || player.Gold < beforeGold || !entry.IsStocked;
+            });
+            if (!task.IsCompleted) task.Wait(2000);
+            task.GetAwaiter().GetResult();
             _syncCtx.Pump();
             Log($"Bought potion: {entry.Model.GetType().Name} for {entry.Cost}g");
         }
@@ -1066,6 +1326,27 @@ public class RunSimulator
         }
 
         return DetectDecisionPoint();
+    }
+
+    private void WaitForMerchantAction(Task task, Func<bool>? completionSignal = null)
+    {
+        for (int i = 0; i < 120; i++)
+        {
+            _syncCtx.Pump();
+            if (_cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null)
+                break;
+            if (completionSignal != null && completionSignal())
+                break;
+            if (task.IsCompleted)
+                break;
+            Thread.Sleep(10);
+        }
+
+        WaitForActionExecutor();
+        _syncCtx.Pump();
+        Thread.Sleep(120);
+        _syncCtx.Pump();
+        WaitForActionExecutor();
     }
 
     private Dictionary<string, object?> DoRemoveCard(Player player)
@@ -1396,6 +1677,12 @@ public class RunSimulator
     private Dictionary<string, object?> DoProceed(Player player)
     {
         Log("Proceeding");
+
+        if (CombatManager.Instance.IsInProgress && !player.Creature.IsDead)
+        {
+            Log("Proceed requested during combat; delegating to end turn");
+            return DoEndTurn(player);
+        }
 
         // Check if we need to move to next act (boss defeated)
         var room = _runState?.CurrentRoom;
@@ -1930,15 +2217,14 @@ public class RunSimulator
                 var rewards = rewardsSet.GenerateWithoutOffering().GetAwaiter().GetResult();
                 _syncCtx.Pump();
 
-                // Auto-collect gold and potions, but present card choices to agent
+                // Auto-collect gold/relics and score potion replacements, but present card choices to agent
                 var cardRewards = new List<CardReward>();
                 foreach (var reward in rewards)
                 {
                     if (reward is GoldReward || reward is MegaCrit.Sts2.Core.Rewards.RelicReward
                         || reward is MegaCrit.Sts2.Core.Rewards.PotionReward)
                     {
-                        try { reward.OnSelectWrapper().GetAwaiter().GetResult(); _syncCtx.Pump(); }
-                        catch (Exception ex) { Log($"Auto-collect reward: {ex.Message}"); }
+                        AutoCollectCombatReward(player, reward);
                     }
                     else if (reward is CardReward cr)
                     {

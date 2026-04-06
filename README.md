@@ -18,6 +18,20 @@ Forked from [wuhao21/sts2-cli](https://github.com/wuhao21/sts2-cli). This fork k
   - generic path examples instead of personal machine paths
   - runtime outputs ignored from Git
 
+## Local Runtime Files
+
+The repo is set up so machine-specific runtime artifacts do not need to be committed.
+
+Ignored local/runtime items include:
+
+- `lib/`
+- `logs/`
+- `saves/`
+- `service.out.log`
+- `service.err.log`
+
+`lib/` is where copied game DLLs land after local setup, so your game installation details stay out of Git.
+
 ## Requirements
 
 - [Slay the Spire 2](https://store.steampowered.com/app/2868840/Slay_the_Spire_2/) on Steam

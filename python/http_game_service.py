@@ -302,8 +302,24 @@ class GameInstance:
         self.ascension = DEFAULT_ASCENSION
         self.lang = DEFAULT_LANG
         self.session_started_at = None
+        self._fresh_process_required = False
 
         self._start_process()
+
+    def _cleanup_before_new_session(self):
+        if not self.proc or not self.is_alive():
+            return
+        try:
+            self._execute_command(
+                {"cmd": "cleanup"},
+                "清理残留会话失败",
+                timeout=10,
+                predicate=self._is_ok_payload,
+            )
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.terminate()
+            self._start_process()
 
     def _sync_profile_saves_for_worker(self):
         if not self.profile_dir:
@@ -360,6 +376,7 @@ class GameInstance:
             )
             self._start_io_threads()
             self._start_command_thread()
+            self._fresh_process_required = False
 
             try:
                 return
@@ -469,6 +486,7 @@ class GameInstance:
         self.ascension = ascension
         self.lang = lang
         self.session_started_at = datetime.now()
+        return state
 
     def _validate_state(self, state, prefix):
         if not state:
@@ -582,12 +600,13 @@ class GameInstance:
         return action.get("action") in STATE_CHANGE_REQUIRED_ACTIONS
 
     def _read_after_seq(self, min_seq, timeout=READ_TIMEOUT_SECONDS, predicate=None):
-        if not self.proc:
+        proc = self.proc
+        if not proc:
             return None
 
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if self.proc.poll() is not None:
+            if self.proc is not proc or proc.poll() is not None:
                 return None
 
             remaining = max(0.0, deadline - time.monotonic())
@@ -710,14 +729,33 @@ class GameInstance:
         return True
 
     def start_session(self, game_id, character, seed, game_dir=None, ascension=0, lang="zh", profile_id=None, profile_dir=None):
-        self.ensure_runtime(game_dir=game_dir, profile_id=profile_id, profile_dir=profile_dir)
-        if not self.is_alive():
-            self._start_process()
+        requested_game_dir = game_dir or self.game_dir
+        requested_profile_id = int(profile_id if profile_id is not None else self.profile_id)
+        requested_profile_dir = profile_dir or self.profile_dir
+
+        self.game_dir = requested_game_dir
+        self.profile_id = requested_profile_id
+        self.profile_dir = requested_profile_dir
+
+        # Always use a fresh headless process for a new session. This avoids
+        # leaking card selectors or partial UI state across runs.
+        self.terminate()
         self._clear_session_state()
-        self.game_id = str(game_id)
+        self._start_process()
         self._sync_profile_saves_for_worker()
+
         with self._io_lock:
-            return self._init_game(character, seed, ascension=ascension, lang=lang)
+            self._clear_session_state()
+            try:
+                state = self._init_game(character, seed, ascension=ascension, lang=lang)
+            except Exception:
+                self._fresh_process_required = True
+                self.terminate()
+                self._clear_session_state()
+                raise
+
+            self.game_id = str(game_id)
+            return state
 
     def close_session(self):
         if not self.proc:
@@ -734,15 +772,17 @@ class GameInstance:
                     )
             except Exception as exc:
                 self.last_error = str(exc)
+        self._fresh_process_required = True
         self._clear_session_state()
 
     def _send(self, cmd):
-        if not self.proc or self.proc.poll() is not None or not self.proc.stdin:
+        proc = self.proc
+        if not proc or proc.poll() is not None or not proc.stdin:
             raise self._build_protocol_error("游戏进程未运行")
 
         try:
-            self.proc.stdin.write(json.dumps(cmd, ensure_ascii=False) + "\n")
-            self.proc.stdin.flush()
+            proc.stdin.write(json.dumps(cmd, ensure_ascii=False) + "\n")
+            proc.stdin.flush()
         except Exception as exc:
             raise self._build_protocol_error(f"发送命令失败: {exc}") from exc
 
@@ -872,23 +912,24 @@ class GameInstance:
         if self._command_thread and self._command_thread.is_alive():
             self._command_thread.join(timeout=1.0)
 
-        if not self.proc:
+        proc = self.proc
+        if not proc:
             self._clear_session_state()
             return
 
         try:
-            if self.proc.poll() is None and self.proc.stdin:
+            if proc.poll() is None and proc.stdin:
                 try:
-                    self.proc.stdin.write(json.dumps({"cmd": "quit"}) + "\n")
-                    self.proc.stdin.flush()
+                    proc.stdin.write(json.dumps({"cmd": "quit"}) + "\n")
+                    proc.stdin.flush()
                 except Exception:
                     pass
 
-            self.proc.terminate()
-            self.proc.wait(timeout=5)
+            proc.terminate()
+            proc.wait(timeout=5)
         except Exception:
             try:
-                self.proc.kill()
+                proc.kill()
             except Exception:
                 pass
         finally:
@@ -900,7 +941,8 @@ class GameInstance:
             self._clear_session_state()
 
     def is_alive(self):
-        return bool(self.proc and self.proc.poll() is None)
+        proc = self.proc
+        return bool(proc and proc.poll() is None)
 
     def summary(self):
         state = self.get_state() or {}
@@ -946,15 +988,41 @@ def _normalize_worker_key(value):
         return str(value)
 
 
+def _detach_games_for_worker(worker):
+    with game_lock:
+        targets = [(game_id, game) for game_id, game in games.items() if game is worker]
+        for game_id, _game in targets:
+            games.pop(game_id, None)
+
+    closed = []
+    failed = []
+    for game_id, game in targets:
+        try:
+            game.close()
+            closed.append(game_id)
+        except Exception as exc:
+            failed.append({"game_id": game_id, "message": str(exc)})
+    return {"requested": [game_id for game_id, _game in targets], "closed": closed, "failed": failed}
+
+
 def _acquire_worker(worker_key, game_dir=None, profile_id=None, profile_dir=None):
     normalized_key = _normalize_worker_key(worker_key)
     stale_worker = None
     with game_lock:
         worker = workers.get(normalized_key)
-        if worker is not None:
+    if worker is not None:
+        reclaim_result = _detach_games_for_worker(worker)
+        if reclaim_result["requested"]:
+            print(
+                f"[HTTP-GAME] reclaimed worker {normalized_key}: closed={len(reclaim_result['closed'])} failed={len(reclaim_result['failed'])}",
+                file=sys.stderr,
+            )
+        with game_lock:
             busy = worker.has_active_session() and any(current is worker for current in games.values())
             if busy:
                 raise RuntimeError(f"Worker {normalized_key} is busy")
+    with game_lock:
+        if worker is not None:
             if not worker.is_alive() or not worker.matches_runtime(
                 game_dir=game_dir or worker.game_dir,
                 profile_id=profile_id if profile_id is not None else worker.profile_id,
