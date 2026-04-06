@@ -16,3 +16,4 @@ logs/
 saves/
 service.out.log
 service.err.log
+tmp/
