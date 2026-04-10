@@ -29,7 +29,7 @@ LIB_DIR = os.path.join(ROOT, "lib")
 DEFAULT_ASCENSION = 0
 DEFAULT_LANG = "zh"
 READ_TIMEOUT_SECONDS = 30
-SETTLE_WINDOW_SECONDS = 0.12
+SETTLE_WINDOW_SECONDS = 0.02
 DEFAULT_PROFILE_ID = 0
 
 app = Flask(__name__)
@@ -418,7 +418,10 @@ class GameInstance:
                 if proc.poll() is not None:
                     break
                 continue
-            self._stderr_lines.append(line.strip())
+            text = line.strip()
+            self._stderr_lines.append(text)
+            if "[SIM] perf " in text or "[SIM] EndTurn" in text or "[SIM] Combat" in text:
+                print(text, file=sys.stderr, flush=True)
 
     def _start_io_threads(self):
         self._stdout_thread = threading.Thread(target=self._stdout_worker, daemon=True)
@@ -611,7 +614,7 @@ class GameInstance:
 
             remaining = max(0.0, deadline - time.monotonic())
             try:
-                seq, payload = self._response_queue.get(timeout=min(0.25, remaining))
+                seq, payload = self._response_queue.get(timeout=min(0.05, remaining))
                 if seq <= min_seq:
                     continue
                 if predicate and not predicate(payload):
@@ -630,7 +633,7 @@ class GameInstance:
         while time.monotonic() < deadline:
             remaining = max(0.0, deadline - time.monotonic())
             try:
-                _seq, payload = self._response_queue.get(timeout=min(0.03, remaining))
+                _seq, payload = self._response_queue.get(timeout=min(0.005, remaining))
             except queue.Empty:
                 break
 
@@ -1361,6 +1364,29 @@ def list_games():
         game_list = [game.summary() for game in games.values()]
 
     return jsonify({"status": "success", "games": game_list})
+
+
+@app.route("/admin/worker_debug", methods=["GET"])
+def worker_debug():
+    with game_lock:
+        worker_items = list(workers.items())
+
+    payload = []
+    for worker_key, worker in worker_items:
+        if worker is None:
+            continue
+        payload.append(
+            {
+                "worker_key": str(worker_key),
+                "game_id": worker.game_id,
+                "alive": worker.is_alive(),
+                "last_action": worker.last_action,
+                "last_error": worker.last_error,
+                "stderr_tail": list(worker._stderr_lines)[-40:],
+            }
+        )
+
+    return jsonify({"status": "success", "workers": payload})
 
 
 @app.route("/games/list", methods=["GET", "POST"])
