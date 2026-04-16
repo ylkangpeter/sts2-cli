@@ -207,6 +207,9 @@ public class RunSimulator
 {
     private static readonly bool CompactCombatState =
         Environment.GetEnvironmentVariable("STS2_COMPACT_COMBAT_STATE") == "1";
+    private static readonly int ActionExecutorMaxPumps = EnvInt("STS2_ACTION_EXECUTOR_MAX_PUMPS", 250);
+    private static readonly int ActionExecutorSpinPumps = EnvInt("STS2_ACTION_EXECUTOR_SPIN_PUMPS", 40);
+    private static readonly int CombatDecisionMaxPumps = EnvInt("STS2_COMBAT_DECISION_MAX_PUMPS", 200);
 
     private RunState? _runState;
     private static bool _modelDbInitialized;
@@ -859,6 +862,20 @@ public class RunSimulator
         // BUG-013: Wait for any pending actions (relic sessions, etc.) to complete before entering new room
         ProfilePhase("DoMapSelect.pre_wait", WaitForActionExecutor, warnMs: 20);
         ProfilePhase("DoMapSelect.pre_pump", () => _syncCtx.Pump(), warnMs: 20);
+        if (CombatManager.Instance.IsInProgress)
+        {
+            Log("Map selection requested while combat is still resolving; waiting before entering next room");
+            SpinWaitForCombatStable();
+            WaitForCombatDecisionReady();
+            _syncCtx.Pump();
+            WaitForActionExecutor();
+            if (CombatManager.Instance.IsInProgress)
+            {
+                Log("Resetting residual combat state before map selection");
+                try { CombatManager.Instance.Reset(graceful: true); } catch { }
+                try { _syncCtx.Pump(); } catch { }
+            }
+        }
 
         // Call EnterMapCoord directly (same as what MoveToMapCoordAction does in TestMode)
         // This avoids the action executor which can swallow errors silently.
@@ -1203,14 +1220,21 @@ public class RunSimulator
             var idx = Convert.ToInt32(args["card_index"]);
             Log($"Resolving event card reward: index {idx}");
             _cardSelector.ResolveReward(idx);
-            Thread.Sleep(50);
             ProfilePhase("DoSelectCardReward.event_pump", () => _syncCtx.Pump(), warnMs: 20);
             ProfilePhase("DoSelectCardReward.event_wait", WaitForActionExecutor, warnMs: 20);
             return ProfilePhase("DoSelectCardReward.event_detect", DetectDecisionPoint, warnMs: 20);
         }
 
         if (_pendingCardReward == null)
-            return Error("No pending card reward");
+        {
+            Log("select_card_reward received with no pending reward; refreshing decision state");
+            _syncCtx.Pump();
+            WaitForActionExecutor();
+            if (_cardSelector.HasPendingReward)
+                return DoSelectCardReward(player, args);
+            if (_pendingCardReward == null)
+                return DetectDecisionPoint();
+        }
         if (args == null || !args.ContainsKey("card_index"))
             return Error("select_card_reward requires 'card_index'");
 
@@ -1249,7 +1273,6 @@ public class RunSimulator
         {
             Log("Skipping event card reward");
             _cardSelector.SkipReward();
-            Thread.Sleep(50);
             _syncCtx.Pump();
             WaitForActionExecutor();
             return DetectDecisionPoint();
@@ -1259,6 +1282,16 @@ public class RunSimulator
             Log("Skipping card reward");
             _pendingCardReward.OnSkipped();
             _pendingCardReward = null;
+        }
+        else
+        {
+            Log("skip_card_reward received with no pending reward; refreshing decision state");
+            _syncCtx.Pump();
+            WaitForActionExecutor();
+            if (_cardSelector.HasPendingReward)
+                return DoSkipCardReward(player);
+            if (_pendingCardReward == null)
+                return DetectDecisionPoint();
         }
         if (_runState?.CurrentRoom is CombatRoom combatRoom && !CombatManager.Instance.IsInProgress)
             return DetectPostCombatState(player, combatRoom);
@@ -1580,6 +1613,11 @@ public class RunSimulator
         if (idx < 0 || idx >= potionsList.Count) return Error($"Invalid potion index {idx}");
         var potion = potionsList[idx];
         if (potion == null) return Error($"No potion at index {idx}");
+        if (!CombatManager.Instance.IsInProgress)
+        {
+            Log("Ignoring use_potion outside combat; returning current decision");
+            return DetectDecisionPoint();
+        }
 
         // Determine target based on potion's TargetType first, then fall back to target_index.
         // Single-target player potions (including AnyPlayer in combat) must receive the
@@ -2573,6 +2611,12 @@ public class RunSimulator
             try { RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult(); _syncCtx.Pump(); }
             catch (Exception ex) { Log($"ForceToMap: {ex.Message}"); }
         }
+        if (_runState?.CurrentRoom is MapRoom && CombatManager.Instance.IsInProgress)
+        {
+            Log("Resetting residual combat state after returning to map");
+            try { CombatManager.Instance.Reset(graceful: true); } catch { }
+            try { _syncCtx.Pump(); } catch { }
+        }
     }
 
     private Dictionary<string, object?> EventChoiceState(EventRoom eventRoom)
@@ -2947,7 +2991,7 @@ public class RunSimulator
             if (executor.IsRunning)
             {
                 // Pump while waiting for executor
-                int maxPumps = 1000;
+                int maxPumps = Math.Max(20, ActionExecutorMaxPumps);
                 for (int i = 0; i < maxPumps; i++)
                 {
                     _syncCtx.Pump();
@@ -2959,7 +3003,10 @@ public class RunSimulator
                         break;
                     }
                     if (!executor.IsRunning) break;
-                    Thread.Sleep(1);
+                    if (i < ActionExecutorSpinPumps)
+                        Thread.Yield();
+                    else
+                        Thread.Sleep(1);
                 }
             }
         }
@@ -2997,7 +3044,8 @@ public class RunSimulator
         if (CombatManager.Instance.IsPlayPhase)
             return;
 
-        for (int i = 0; i < 800; i++)
+        var maxPumps = Math.Max(40, CombatDecisionMaxPumps);
+        for (int i = 0; i < maxPumps; i++)
         {
             _syncCtx.Pump();
             WaitForActionExecutor();
@@ -3416,6 +3464,12 @@ public class RunSimulator
     {
         var raw = Environment.GetEnvironmentVariable("STS2_PROFILE_ID");
         return int.TryParse(raw, out var parsed) && parsed >= 0 ? parsed : 0;
+    }
+
+    private static int EnvInt(string name, int defaultValue)
+    {
+        var raw = Environment.GetEnvironmentVariable(name);
+        return int.TryParse(raw, out var parsed) && parsed > 0 ? parsed : defaultValue;
     }
 
     private Player? CreatePlayer(string characterName)

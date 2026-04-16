@@ -1,5 +1,5 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 """
 HTTP 游戏服务 - 通过网络与游戏交互
 
@@ -320,6 +320,7 @@ class GameInstance:
         self._command_thread = None
         self._closed = threading.Event()
         self._startup_drained = False
+        self._reserved = False
         self.game_id = None
         self.character = None
         self.seed = None
@@ -770,7 +771,7 @@ class GameInstance:
         )
 
     def has_active_session(self):
-        return bool(self.game_id)
+        return bool(self.game_id or self._reserved)
 
     def ensure_runtime(self, *, game_dir=None, profile_id=None, profile_dir=None):
         requested_game_dir = game_dir or self.game_dir
@@ -811,7 +812,7 @@ class GameInstance:
         )
         if not restarted:
             try:
-                if self.has_active_session() or self.get_state() is not None:
+                if self.game_id or self.get_state() is not None:
                     self._cleanup_before_new_session()
             except Exception:
                 self._fresh_process_required = True
@@ -830,9 +831,11 @@ class GameInstance:
                 self._fresh_process_required = True
                 self.terminate()
                 self._clear_session_state()
+                self._reserved = False
                 raise
 
             self.game_id = str(game_id)
+            self._reserved = False
             self._fresh_process_required = False
             return state
 
@@ -853,6 +856,7 @@ class GameInstance:
                 self.last_error = str(exc)
         self._fresh_process_required = False
         self._clear_session_state()
+        self._reserved = False
 
     def _send(self, cmd):
         proc = self.proc
@@ -994,6 +998,7 @@ class GameInstance:
         proc = self.proc
         if not proc:
             self._clear_session_state()
+            self._reserved = False
             return
 
         try:
@@ -1018,6 +1023,7 @@ class GameInstance:
                 self._stderr_thread.join(timeout=0.5)
             self.proc = None
             self._clear_session_state()
+            self._reserved = False
 
     def is_alive(self):
         proc = self.proc
@@ -1085,31 +1091,59 @@ def _detach_games_for_worker(worker):
 
 
 def _acquire_worker(worker_key, game_dir=None, profile_id=None, profile_dir=None):
+    explicit_worker = worker_key not in (None, "")
     normalized_key = _normalize_worker_key(worker_key)
     stale_worker = None
     with game_lock:
-        worker = workers.get(normalized_key)
-    if worker is not None:
-        reclaim_result = _detach_games_for_worker(worker)
-        if reclaim_result["requested"]:
-            print(
-                f"[HTTP-GAME] reclaimed worker {normalized_key}: closed={len(reclaim_result['closed'])} failed={len(reclaim_result['failed'])}",
-                file=sys.stderr,
-            )
-        with game_lock:
-            busy = worker.has_active_session() and any(current is worker for current in games.values())
-            if busy:
+        if not explicit_worker:
+            dead_keys = [
+                key
+                for key, candidate in workers.items()
+                if candidate is None or not candidate.is_alive()
+            ]
+            for key in dead_keys:
+                stale_worker = workers.pop(key, None) or stale_worker
+
+            for key, candidate in workers.items():
+                if candidate is None:
+                    continue
+                if candidate.has_active_session():
+                    continue
+                if not candidate.matches_runtime(
+                    game_dir=game_dir or candidate.game_dir,
+                    profile_id=profile_id if profile_id is not None else candidate.profile_id,
+                    profile_dir=profile_dir or candidate.profile_dir,
+                ):
+                    continue
+                candidate._reserved = True
+                return candidate
+
+            if "default" not in workers:
+                normalized_key = "default"
+            else:
+                index = 1
+                while True:
+                    normalized_key = f"auto_{index:02d}"
+                    if normalized_key not in workers:
+                        break
+                    index += 1
+            worker = None
+        else:
+            worker = workers.get(normalized_key)
+            if worker is not None and worker.has_active_session():
                 raise RuntimeError(f"Worker {normalized_key} is busy")
-    with game_lock:
-        if worker is not None:
-            if not worker.is_alive() or not worker.matches_runtime(
-                game_dir=game_dir or worker.game_dir,
-                profile_id=profile_id if profile_id is not None else worker.profile_id,
-                profile_dir=profile_dir or worker.profile_dir,
+            if worker is not None and (
+                not worker.is_alive()
+                or not worker.matches_runtime(
+                    game_dir=game_dir or worker.game_dir,
+                    profile_id=profile_id if profile_id is not None else worker.profile_id,
+                    profile_dir=profile_dir or worker.profile_dir,
+                )
             ):
                 workers.pop(normalized_key, None)
                 stale_worker = worker
                 worker = None
+
         if worker is None:
             worker = GameInstance(
                 normalized_key,
@@ -1118,6 +1152,7 @@ def _acquire_worker(worker_key, game_dir=None, profile_id=None, profile_dir=None
                 profile_dir=profile_dir,
             )
             workers[normalized_key] = worker
+        worker._reserved = True
     if stale_worker is not None:
         try:
             stale_worker.terminate()
@@ -1526,4 +1561,17 @@ if __name__ == "__main__":
     print("使用 GET /state/<game_id> 获取游戏状态")
     print("使用 POST /step/<game_id> 或 /command/<game_id> 执行动作")
     print("使用 POST /close/<game_id> 关闭游戏")
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+    try:
+        from waitress import serve
+
+        serve(
+            app,
+            host="0.0.0.0",
+            port=5000,
+            threads=int(os.environ.get("STS2_HTTP_THREADS", "32")),
+            connection_limit=int(os.environ.get("STS2_HTTP_CONNECTION_LIMIT", "256")),
+            channel_timeout=int(os.environ.get("STS2_HTTP_CHANNEL_TIMEOUT", "120")),
+        )
+    except ImportError:
+        print("waitress 未安装，回退到 Flask dev server")
+        app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)

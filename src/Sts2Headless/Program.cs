@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Runtime.Loader;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -16,6 +17,8 @@ class Program
 
     static void Main(string[] args)
     {
+        Console.SetError(new FilteredErrorWriter(Console.Error));
+
         // Prevent unhandled exceptions from crashing the process
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
         {
@@ -159,5 +162,43 @@ class Program
     {
         Console.Out.WriteLine(JsonSerializer.Serialize(data, JsonOpts));
         Console.Out.Flush();
+    }
+
+    private sealed class FilteredErrorWriter : TextWriter
+    {
+        private readonly TextWriter _inner;
+        private readonly bool _verbose;
+
+        public FilteredErrorWriter(TextWriter inner)
+        {
+            _inner = inner;
+            _verbose = Environment.GetEnvironmentVariable("STS2_HEADLESS_LOG") == "1";
+        }
+
+        public override Encoding Encoding => _inner.Encoding;
+
+        public override void WriteLine(string? value)
+        {
+            if (_verbose || ShouldKeep(value))
+            {
+                _inner.WriteLine(value);
+                _inner.Flush();
+            }
+        }
+
+        public override void Write(char value)
+        {
+            if (_verbose)
+                _inner.Write(value);
+        }
+
+        private static bool ShouldKeep(string? value)
+        {
+            if (string.IsNullOrEmpty(value))
+                return false;
+            return value.Contains("[WARN]", StringComparison.Ordinal)
+                || value.Contains("[FATAL]", StringComparison.Ordinal)
+                || value.Contains("[ERROR]", StringComparison.Ordinal);
+        }
     }
 }
