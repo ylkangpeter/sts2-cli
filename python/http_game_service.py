@@ -8,6 +8,7 @@ HTTP 游戏服务 - 通过网络与游戏交互
 
 import atexit
 import json
+import logging
 import os
 import platform
 import queue
@@ -25,14 +26,19 @@ from flask import Flask, jsonify, request
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROJECT = os.path.join(ROOT, "src", "Sts2Headless", "Sts2Headless.csproj")
 LIB_DIR = os.path.join(ROOT, "lib")
+BUILD_CONFIGURATION = os.environ.get("STS2_HEADLESS_CONFIGURATION", "Release")
+BUILD_OUTPUT_DIR = os.path.join(ROOT, "src", "Sts2Headless", "bin", BUILD_CONFIGURATION, "net9.0")
+HEADLESS_DLL = os.path.join(BUILD_OUTPUT_DIR, "Sts2Headless.dll")
+HEADLESS_EXE = os.path.join(BUILD_OUTPUT_DIR, "Sts2Headless.exe")
 
 DEFAULT_ASCENSION = 0
 DEFAULT_LANG = "zh"
-READ_TIMEOUT_SECONDS = 30
-SETTLE_WINDOW_SECONDS = 0.02
+READ_TIMEOUT_SECONDS = 60
+SETTLE_WINDOW_SECONDS = float(os.environ.get("STS2_SETTLE_WINDOW_SECONDS", "0.001"))
 DEFAULT_PROFILE_ID = 0
 
 app = Flask(__name__)
+logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 games = {}
 workers = {}
@@ -84,6 +90,8 @@ def _find_dotnet():
     """Find a usable .NET SDK binary."""
     candidates = [
         "dotnet",
+        r"C:\Program Files\dotnet\dotnet.exe",
+        r"C:\Program Files (x86)\dotnet\dotnet.exe",
         os.path.expanduser("~/.dotnet/dotnet"),
         os.path.expanduser("~/.dotnet-arm64/dotnet"),
     ]
@@ -178,7 +186,18 @@ def _copy_required_dlls(game_dir):
         shutil.copy2(sts2, backup)
 
 
-def _ensure_setup(dotnet, game_dir=None):
+def _headless_entry_command(dotnet=None):
+    if os.path.isfile(HEADLESS_EXE):
+        return [HEADLESS_EXE]
+    if os.path.isfile(HEADLESS_DLL):
+        if not dotnet:
+            dotnet = _find_dotnet()
+        if dotnet:
+            return [dotnet, HEADLESS_DLL]
+    return None
+
+
+def _ensure_setup(dotnet=None, game_dir=None):
     sts2_dll = os.path.join(LIB_DIR, "sts2.dll")
     resolved_game_dir = _find_game_dir(game_dir)
     if not os.path.isfile(sts2_dll):
@@ -188,13 +207,17 @@ def _ensure_setup(dotnet, game_dir=None):
             )
         _copy_required_dlls(resolved_game_dir)
 
-    exe = os.path.join(ROOT, "src", "Sts2Headless", "bin", "Debug", "net9.0", "Sts2Headless.dll")
-    should_build = (not os.path.isfile(exe)) or (
-        os.path.isfile(sts2_dll) and os.path.getmtime(sts2_dll) > os.path.getmtime(exe)
+    output_path = HEADLESS_EXE if os.path.isfile(HEADLESS_EXE) else HEADLESS_DLL
+    should_build = (not os.path.isfile(output_path)) or (
+        os.path.isfile(sts2_dll) and os.path.getmtime(sts2_dll) > os.path.getmtime(output_path)
     )
     if should_build:
+        if not dotnet:
+            dotnet = _find_dotnet()
+        if not dotnet:
+            raise RuntimeError("未找到 .NET SDK，请安装 .NET 9+")
         result = subprocess.run(
-            [dotnet, "build", PROJECT],
+            [dotnet, "build", PROJECT, "-c", BUILD_CONFIGURATION],
             capture_output=True,
             text=True,
             timeout=300,
@@ -296,6 +319,7 @@ class GameInstance:
         self._command_queue = queue.Queue()
         self._command_thread = None
         self._closed = threading.Event()
+        self._startup_drained = False
         self.game_id = None
         self.character = None
         self.seed = None
@@ -334,9 +358,6 @@ class GameInstance:
 
     def _build_process_env(self):
         dotnet = _find_dotnet()
-        if not dotnet:
-            raise RuntimeError("未找到 .NET SDK，请安装 .NET 9+")
-
         resolved_game_dir = _ensure_setup(dotnet, self.game_dir)
         if resolved_game_dir:
             self.game_dir = resolved_game_dir
@@ -350,41 +371,34 @@ class GameInstance:
             env["STS2_PROFILE_SAVE_DIR"] = self.profile_dir
         else:
             copied = []
-        return dotnet, env, copied
+        launch_cmd = _headless_entry_command(dotnet)
+        if not launch_cmd:
+            raise RuntimeError("未找到可执行的 Sts2Headless 产物")
+        return launch_cmd, env, copied
 
     def _start_process(self):
-        dotnet, env, _copied = self._build_process_env()
-
-        last_error = None
-        for no_build in (True, False):
-            self._closed.clear()
-            self._response_queue = queue.Queue()
-            self._response_seq = 0
-            self._stderr_lines = deque(maxlen=200)
-            self._command_queue = queue.Queue()
-            self.proc = subprocess.Popen(
-                [dotnet, "run", *(["--no-build"] if no_build else []), "--project", PROJECT],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                env=env,
-                **_windows_subprocess_kwargs(),
-            )
-            self._start_io_threads()
-            self._start_command_thread()
-            self._fresh_process_required = False
-
-            try:
-                return
-            except Exception as exc:
-                last_error = exc
-                self.terminate()
-
-        raise RuntimeError(f"启动游戏进程失败: {last_error}")
+        launch_cmd, env, _copied = self._build_process_env()
+        self._closed.clear()
+        self._response_queue = queue.Queue()
+        self._response_seq = 0
+        self._stderr_lines = deque(maxlen=200)
+        self._command_queue = queue.Queue()
+        self.proc = subprocess.Popen(
+            launch_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env=env,
+            **_windows_subprocess_kwargs(),
+        )
+        self._start_io_threads()
+        self._start_command_thread()
+        self._fresh_process_required = False
+        self._startup_drained = False
 
     def _stdout_worker(self):
         proc = self.proc
@@ -463,11 +477,13 @@ class GameInstance:
     def _init_game(self, character, seed, ascension=0, lang=DEFAULT_LANG):
         # Simulator emits a startup handshake JSON before start_run.
         # Drain one startup payload first, otherwise it may be mistaken as game state.
-        startup_seq = self._next_response_seq()
-        try:
-            self._read_after_seq(startup_seq, timeout=10)
-        except Exception:
-            pass
+        if not self._startup_drained:
+            startup_seq = self._next_response_seq()
+            try:
+                self._read_after_seq(startup_seq, timeout=10)
+            except Exception:
+                pass
+            self._startup_drained = True
 
         init_cmd = {
             "cmd": "start_run",
@@ -503,6 +519,45 @@ class GameInstance:
             return None
 
         context = dict(state.get("context") or {})
+        cards = tuple(
+            (
+                card.get("index"),
+                card.get("id") or card.get("name"),
+                card.get("cost"),
+                card.get("is_stocked"),
+                card.get("on_sale"),
+            )
+            for card in (state.get("cards") or [])
+            if isinstance(card, dict)
+        )
+        relics = tuple(
+            (
+                relic.get("index"),
+                relic.get("name") or relic.get("id"),
+                relic.get("cost"),
+                relic.get("is_stocked"),
+            )
+            for relic in (state.get("relics") or [])
+            if isinstance(relic, dict)
+        )
+        potions = tuple(
+            (
+                potion.get("index"),
+                potion.get("name") or potion.get("id"),
+                potion.get("cost"),
+                potion.get("is_stocked"),
+            )
+            for potion in (state.get("potions") or [])
+            if isinstance(potion, dict)
+        )
+        bundles = tuple(
+            (
+                bundle.get("index"),
+                bundle.get("name") or bundle.get("id"),
+            )
+            for bundle in (state.get("bundles") or [])
+            if isinstance(bundle, dict)
+        )
         enemies = tuple(
             (
                 enemy.get("index"),
@@ -573,6 +628,7 @@ class GameInstance:
             context.get("act"),
             context.get("floor"),
             context.get("room_type"),
+            tuple(sorted(context.get("boss", {}).items())) if isinstance(context.get("boss"), dict) else context.get("boss"),
             state.get("round"),
             state.get("turn"),
             state.get("energy"),
@@ -588,6 +644,13 @@ class GameInstance:
             enemies,
             hand,
             options,
+            cards,
+            relics,
+            potions,
+            bundles,
+            state.get("card_removal_cost"),
+            state.get("can_skip"),
+            state.get("event_name"),
             state.get("game_over"),
             state.get("victory"),
         )
@@ -715,6 +778,7 @@ class GameInstance:
         requested_profile_dir = profile_dir or self.profile_dir
         needs_restart = (
             not self.is_alive()
+            or self._fresh_process_required
             or not self.matches_runtime(
                 game_dir=requested_game_dir,
                 profile_id=requested_profile_id,
@@ -740,13 +804,24 @@ class GameInstance:
         self.profile_id = requested_profile_id
         self.profile_dir = requested_profile_dir
 
-        # Always use a fresh headless process for a new session. This avoids
-        # leaking card selectors or partial UI state across runs.
-        self.terminate()
-        self._clear_session_state()
-        self._start_process()
-        self._sync_profile_saves_for_worker()
-
+        restarted = self.ensure_runtime(
+            game_dir=requested_game_dir,
+            profile_id=requested_profile_id,
+            profile_dir=requested_profile_dir,
+        )
+        if not restarted:
+            try:
+                if self.has_active_session() or self.get_state() is not None:
+                    self._cleanup_before_new_session()
+            except Exception:
+                self._fresh_process_required = True
+                restarted = self.ensure_runtime(
+                    game_dir=requested_game_dir,
+                    profile_id=requested_profile_id,
+                    profile_dir=requested_profile_dir,
+                )
+                if not restarted:
+                    raise
         with self._io_lock:
             self._clear_session_state()
             try:
@@ -758,6 +833,7 @@ class GameInstance:
                 raise
 
             self.game_id = str(game_id)
+            self._fresh_process_required = False
             return state
 
     def close_session(self):
@@ -775,7 +851,7 @@ class GameInstance:
                     )
             except Exception as exc:
                 self.last_error = str(exc)
-        self._fresh_process_required = True
+        self._fresh_process_required = False
         self._clear_session_state()
 
     def _send(self, cmd):
@@ -1143,20 +1219,24 @@ def _flatten_map_data(map_data):
     return flattened
 
 
-def _public_state(game, state):
+def _public_state(game, state, *, include_map=None):
     if not state:
         return state
     view = dict(state)
     raw_decision = view.get("decision")
     view["decision"] = DECISION_ALIAS.get(raw_decision, raw_decision)
     view["game_over"] = bool(view.get("game_over") or view.get("decision") == "game_over")
-    try:
-        full_map = game.get_map()
-    except Exception:
-        full_map = None
-    if isinstance(full_map, dict) and full_map.get("type") == "map":
-        view["full_map"] = full_map
-        view["map"] = _flatten_map_data(full_map)
+    should_include_map = include_map
+    if should_include_map is None:
+        should_include_map = view.get("decision") in ("map_node", "map_select")
+    if should_include_map:
+        try:
+            full_map = game.get_map()
+        except Exception:
+            full_map = None
+        if isinstance(full_map, dict) and full_map.get("type") == "map":
+            view["full_map"] = full_map
+            view["map"] = _flatten_map_data(full_map)
     return view
 
 
@@ -1411,7 +1491,12 @@ def health():
     with game_lock:
         active_games = sum(1 for game in games.values() if game.is_alive())
         total_workers = len(workers)
-        busy_workers = sum(1 for worker in workers.values() if worker.has_active_session())
+        active_worker_ids = {id(game) for game in games.values() if game is not None}
+        busy_workers = sum(
+            1
+            for worker in workers.values()
+            if worker.has_active_session() and id(worker) in active_worker_ids
+        )
 
     return jsonify(
         {

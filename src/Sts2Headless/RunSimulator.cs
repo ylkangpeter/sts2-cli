@@ -94,6 +94,11 @@ internal class LocLookup
 {
     private readonly Dictionary<string, Dictionary<string, string>> _eng = new();
     private readonly Dictionary<string, Dictionary<string, string>> _zhs = new();
+    private readonly Dictionary<string, string> _cache = new();
+    private static readonly System.Text.RegularExpressions.Regex BbCodeRegex = new(
+        @"\[/?[a-zA-Z_][a-zA-Z0-9_=]*\]",
+        System.Text.RegularExpressions.RegexOptions.Compiled
+    );
 
     public LocLookup()
     {
@@ -132,7 +137,7 @@ internal class LocLookup
     /// <summary>Strip BBCode tags like [gold], [/blue], [b], [sine], etc.</summary>
     private static string StripBBCode(string text)
     {
-        return System.Text.RegularExpressions.Regex.Replace(text, @"\[/?[a-zA-Z_][a-zA-Z0-9_=]*\]", "");
+        return BbCodeRegex.Replace(text, "");
     }
 
     /// <summary>Language for JSON output: "en" or "zh". Default: "en".</summary>
@@ -141,13 +146,25 @@ internal class LocLookup
     /// <summary>Return localized string for JSON output based on Lang setting.</summary>
     public string Bilingual(string table, string key)
     {
+        var cacheKey = $"{Lang}|{table}|{key}";
+        if (_cache.TryGetValue(cacheKey, out var cached))
+            return cached;
+
+        string result;
         if (Lang == "zh")
         {
             var zh = _zhs.GetValueOrDefault(table)?.GetValueOrDefault(key);
-            if (zh != null) return StripBBCode(zh);
+            if (zh != null)
+            {
+                result = StripBBCode(zh);
+                _cache[cacheKey] = result;
+                return result;
+            }
         }
         var en = _eng.GetValueOrDefault(table)?.GetValueOrDefault(key) ?? key;
-        return StripBBCode(en);
+        result = StripBBCode(en);
+        _cache[cacheKey] = result;
+        return result;
     }
 
     // Convenience helpers using ModelId
@@ -188,6 +205,9 @@ internal class LocLookup
 /// </summary>
 public class RunSimulator
 {
+    private static readonly bool CompactCombatState =
+        Environment.GetEnvironmentVariable("STS2_COMPACT_COMBAT_STATE") == "1";
+
     private RunState? _runState;
     private static bool _modelDbInitialized;
     private static readonly int _profileId = ResolveProfileId();
@@ -207,6 +227,7 @@ public class RunSimulator
     private int _lastKnownHp;
     private readonly HeadlessCardSelector _cardSelector = new();
     private long _profileSequence;
+    private bool _cardSelectorRegistered;
     // Pending bundle selection (Scroll Boxes: pick 1 of N packs)
     private IReadOnlyList<IReadOnlyList<CardModel>>? _pendingBundles;
     private TaskCompletionSource<IEnumerable<CardModel>>? _pendingBundleTcs;
@@ -217,6 +238,9 @@ public class RunSimulator
         {
             _loc.Lang = lang;
             EnsureModelDbInitialized();
+            try { CombatManager.Instance.Reset(graceful: true); } catch { }
+            try { RunManager.Instance.ActionExecutor.Cancel(); } catch { }
+            _syncCtx.Pump();
 
             var player = CreatePlayer(character);
             if (player == null)
@@ -265,7 +289,11 @@ public class RunSimulator
             Log("Entered Act 0");
 
             // Register card selector for cards that need player choice
-            CardSelectCmd.UseSelector(_cardSelector);
+            if (!_cardSelectorRegistered)
+            {
+                CardSelectCmd.UseSelector(_cardSelector);
+                _cardSelectorRegistered = true;
+            }
             LocPatches._bundleSimRef = this;
 
             // Now we should be at the map — detect decision point
@@ -1259,6 +1287,11 @@ public class RunSimulator
         {
             var task = Task.Run(() => entry.OnTryPurchaseWrapper(merchantRoom.Inventory));
             WaitForMerchantAction(task, () => player.Gold < beforeGold || !entry.IsStocked);
+            if (_cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null)
+            {
+                Log("Shop card purchase produced a follow-up decision; returning it immediately");
+                return DetectDecisionPoint();
+            }
             if (!task.IsCompleted) task.Wait(2000);
             task.GetAwaiter().GetResult();
             _syncCtx.Pump();
@@ -1301,6 +1334,11 @@ public class RunSimulator
                 var afterRelicCount = player.Relics?.Count ?? 0;
                 return afterRelicCount > beforeRelicCount || player.Gold < beforeGold || !entry.IsStocked;
             });
+            if (_cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null)
+            {
+                Log("Shop relic purchase produced a follow-up decision; returning it immediately");
+                return DetectDecisionPoint();
+            }
             if (!task.IsCompleted) task.Wait(2000);
             task.GetAwaiter().GetResult();
             _syncCtx.Pump();
@@ -1353,6 +1391,11 @@ public class RunSimulator
                 var afterSlotStats = GetPotionSlotStats(player);
                 return afterSlotStats.used > beforeUsedSlots || player.Gold < beforeGold || !entry.IsStocked;
             });
+            if (_cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null)
+            {
+                Log("Shop potion purchase produced a follow-up decision; returning it immediately");
+                return DetectDecisionPoint();
+            }
             if (!task.IsCompleted) task.Wait(2000);
             task.GetAwaiter().GetResult();
             _syncCtx.Pump();
@@ -1749,11 +1792,16 @@ public class RunSimulator
             Log("Force leaving non-combat room to map");
             try
             {
-                RunManager.Instance.EnterRoom(new MapRoom()).GetAwaiter().GetResult();
+                ForceToMap();
                 _syncCtx.Pump();
                 WaitForActionExecutor();
             }
             catch (Exception ex) { Log($"Force leave: {ex.Message}"); }
+        }
+
+        if (_runState?.CurrentRoom is MapRoom)
+        {
+            return MapSelectState();
         }
         return DetectDecisionPoint();
     }
@@ -2251,17 +2299,25 @@ public class RunSimulator
                 catch { }
 
                 // Enemy powers
-                var ePowers = e.Powers?.Select(pw => new Dictionary<string, object?>
+                var ePowers = e.Powers?.Select(pw =>
                 {
-                    ["name"] = _loc.Power(pw.Id.Entry),
-                    ["description"] = _loc.Bilingual("powers", pw.Id.Entry + ".description"),
-                    ["amount"] = pw.Amount,
+                    var power = new Dictionary<string, object?>
+                    {
+                        ["id"] = pw.Id.Entry,
+                        ["amount"] = pw.Amount,
+                    };
+                    if (!CompactCombatState)
+                    {
+                        power["name"] = _loc.Power(pw.Id.Entry);
+                        power["description"] = _loc.Bilingual("powers", pw.Id.Entry + ".description");
+                    }
+                    return power;
                 }).ToList();
 
-                return new Dictionary<string, object?>
+                var enemyInfo = new Dictionary<string, object?>
                 {
                     ["index"] = i,
-                    ["name"] = _loc.Monster(e.Monster?.Id.Entry ?? "UNKNOWN"),
+                    ["id"] = e.Monster?.Id.Entry ?? "UNKNOWN",
                     ["hp"] = e.CurrentHp,
                     ["max_hp"] = e.MaxHp,
                     ["block"] = e.Block,
@@ -2269,14 +2325,25 @@ public class RunSimulator
                     ["intends_attack"] = e.Monster?.IntendsToAttack ?? false,
                     ["powers"] = ePowers?.Count > 0 ? ePowers : null,
                 };
+                if (!CompactCombatState)
+                    enemyInfo["name"] = _loc.Monster(e.Monster?.Id.Entry ?? "UNKNOWN");
+                return enemyInfo;
             }).ToList() ?? new();
 
         // Player powers/buffs
-        var playerPowers = player.Creature?.Powers?.Select(pw => new Dictionary<string, object?>
+        var playerPowers = player.Creature?.Powers?.Select(pw =>
         {
-            ["name"] = _loc.Power(pw.Id.Entry),
-            ["description"] = _loc.Bilingual("powers", pw.Id.Entry + ".description"),
-            ["amount"] = pw.Amount,
+            var power = new Dictionary<string, object?>
+            {
+                ["id"] = pw.Id.Entry,
+                ["amount"] = pw.Amount,
+            };
+            if (!CompactCombatState)
+            {
+                power["name"] = _loc.Power(pw.Id.Entry);
+                power["description"] = _loc.Bilingual("powers", pw.Id.Entry + ".description");
+            }
+            return power;
         }).ToList();
 
         var result = new Dictionary<string, object?>
@@ -2289,7 +2356,7 @@ public class RunSimulator
             ["max_energy"] = pcs?.MaxEnergy ?? 0,
             ["hand"] = hand,
             ["enemies"] = enemies,
-            ["player"] = PlayerSummary(player),
+            ["player"] = CompactCombatState ? CombatPlayerSummary(player) : PlayerSummary(player),
             ["player_powers"] = playerPowers?.Count > 0 ? playerPowers : null,
             ["draw_pile_count"] = pcs?.DrawPile?.Cards?.Count ?? 0,
             ["discard_pile_count"] = pcs?.DiscardPile?.Cards?.Count ?? 0,
@@ -3184,6 +3251,55 @@ public class RunSimulator
         };
     }
 
+    private Dictionary<string, object?> CombatPlayerSummary(Player player)
+    {
+        var potionSlotStats = GetPotionSlotStats(player);
+        return new Dictionary<string, object?>
+        {
+            ["name"] = _loc.Bilingual("characters", (player.Character?.Id.Entry ?? "IRONCLAD") + ".title"),
+            ["hp"] = player.Creature?.CurrentHp ?? 0,
+            ["max_hp"] = player.Creature?.MaxHp ?? 0,
+            ["block"] = player.Creature?.Block ?? 0,
+            ["gold"] = player.Gold,
+            ["deck_size"] = player.Deck?.Cards?.Count(c => c != null) ?? 0,
+            ["deck"] = player.Deck?.Cards?.Where(c => c != null).Select(c => new Dictionary<string, object?>
+            {
+                ["id"] = c.Id.ToString(),
+                ["cost"] = c.EnergyCost?.GetResolved() ?? 0,
+                ["type"] = c.Type.ToString(),
+                ["upgraded"] = c.IsUpgraded,
+            }).ToList(),
+            ["relics"] = player.Relics?.Select(r =>
+            {
+                var vars = new Dictionary<string, object?>();
+                try { foreach (var dv in r.DynamicVars.Values) vars[dv.Name] = (int)dv.BaseValue; } catch { }
+                return new Dictionary<string, object?>
+                {
+                    ["id"] = r.Id.Entry,
+                    ["vars"] = vars.Count > 0 ? vars : null,
+                };
+            }).ToList(),
+            ["potions"] = player.Potions?.Select((p, i) =>
+            {
+                if (p == null) return null;
+                var pvars = new Dictionary<string, object?>();
+                try { foreach (var dv in p.DynamicVars.Values) pvars[dv.Name] = (int)dv.BaseValue; } catch { }
+                return new Dictionary<string, object?>
+                {
+                    ["index"] = i,
+                    ["id"] = p.Id.Entry,
+                    ["name"] = _loc.Potion(p.Id.Entry),
+                    ["description"] = _loc.Bilingual("potions", p.Id.Entry + ".description"),
+                    ["vars"] = pvars.Count > 0 ? pvars : null,
+                    ["target_type"] = p.TargetType.ToString(),
+                };
+            }).Where(x => x != null).ToList(),
+            ["potion_slots_total"] = potionSlotStats.total,
+            ["potion_slots_used"] = potionSlotStats.used,
+            ["potion_slots_free"] = potionSlotStats.free,
+        };
+    }
+
     /// <summary>Common context added to every decision point.</summary>
     private Dictionary<string, object?> RunContext()
     {
@@ -4006,6 +4122,7 @@ public class RunSimulator
             try { CombatManager.Instance.TurnStarted -= _ => _turnStarted.Set(); } catch { }
             try { CombatManager.Instance.CombatEnded -= _ => _combatEnded.Set(); } catch { }
             try { RunManager.Instance.ActionExecutor.Cancel(); } catch { }
+            try { WaitForActionExecutor(); } catch { }
             try { _cardSelector.CancelPending(); } catch { }
             try { if (_cardSelector.HasPendingReward) _cardSelector.SkipReward(); } catch { }
             try { _pendingBundleTcs?.TrySetResult(Array.Empty<CardModel>()); } catch { }
@@ -4020,8 +4137,11 @@ public class RunSimulator
             _lastKnownHp = 0;
             _turnStarted.Reset();
             _combatEnded.Reset();
-            if (RunManager.Instance.IsInProgress)
-                RunManager.Instance.CleanUp(graceful: true);
+            try { RunManager.Instance.CleanUp(graceful: false); } catch { }
+            try { CombatManager.Instance.Reset(graceful: true); } catch { }
+            try { _syncCtx.Pump(); } catch { }
+            try { WaitForActionExecutor(); } catch { }
+            try { CombatManager.Instance.Reset(graceful: true); } catch { }
             _runState = null;
         }
         catch (Exception ex)
