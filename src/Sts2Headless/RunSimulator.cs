@@ -2001,6 +2001,7 @@ public class RunSimulator
                 ["cards"] = opts,
                 ["min_select"] = _cardSelector.PendingMinSelect,
                 ["max_select"] = _cardSelector.PendingMaxSelect,
+                ["selection_prompt"] = _cardSelector.PendingPrompt,
                 ["player"] = PlayerSummary(player),
             };
             return true;
@@ -2398,6 +2399,10 @@ public class RunSimulator
             ["player_powers"] = playerPowers?.Count > 0 ? playerPowers : null,
             ["draw_pile_count"] = pcs?.DrawPile?.Cards?.Count ?? 0,
             ["discard_pile_count"] = pcs?.DiscardPile?.Cards?.Count ?? 0,
+            ["exhaust_pile_count"] = pcs?.ExhaustPile?.Cards?.Count ?? 0,
+            ["draw_pile"] = CompactPileSummary(pcs?.DrawPile),
+            ["discard_pile"] = CompactPileSummary(pcs?.DiscardPile),
+            ["exhaust_pile"] = CompactPileSummary(pcs?.ExhaustPile),
         };
 
         // Character-specific mechanics
@@ -3263,6 +3268,30 @@ public class RunSimulator
                 };
             }).ToList(),
         };
+    }
+
+    private Dictionary<string, object?> CompactCardSummary(CardModel c)
+    {
+        var stats = new Dictionary<string, object?>();
+        try { foreach (var dv in c.DynamicVars.Values) stats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue; } catch { }
+        var keywords = c.Keywords?.Where(k => k != CardKeyword.None).Select(k => k.ToString()).ToList();
+        return new Dictionary<string, object?>
+        {
+            ["id"] = c.Id.ToString(),
+            ["cost"] = c.EnergyCost?.GetResolved() ?? 0,
+            ["type"] = c.Type.ToString(),
+            ["upgraded"] = c.IsUpgraded,
+            ["stats"] = stats.Count > 0 ? stats : null,
+            ["keywords"] = keywords?.Count > 0 ? keywords : null,
+        };
+    }
+
+    private List<Dictionary<string, object?>> CompactPileSummary(CardPile? pile)
+    {
+        return pile?.Cards?
+            .Where(c => c != null)
+            .Select(c => CompactCardSummary(c))
+            .ToList() ?? new();
     }
 
     private Dictionary<string, object?> CompactPlayerSummary(Player player)
