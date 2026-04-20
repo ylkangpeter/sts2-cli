@@ -30,10 +30,12 @@ BUILD_CONFIGURATION = os.environ.get("STS2_HEADLESS_CONFIGURATION", "Release")
 BUILD_OUTPUT_DIR = os.path.join(ROOT, "src", "Sts2Headless", "bin", BUILD_CONFIGURATION, "net9.0")
 HEADLESS_DLL = os.path.join(BUILD_OUTPUT_DIR, "Sts2Headless.dll")
 HEADLESS_EXE = os.path.join(BUILD_OUTPUT_DIR, "Sts2Headless.exe")
+HEADLESS_PROJECT = os.path.join(ROOT, "src", "Sts2Headless", "Sts2Headless.csproj")
+GODOT_STUBS_PROJECT = os.path.join(ROOT, "src", "GodotStubs", "GodotStubs.csproj")
 
 DEFAULT_ASCENSION = 0
 DEFAULT_LANG = "zh"
-READ_TIMEOUT_SECONDS = 60
+READ_TIMEOUT_SECONDS = int(os.environ.get("STS2_READ_TIMEOUT_SECONDS", "10"))
 SETTLE_WINDOW_SECONDS = float(os.environ.get("STS2_SETTLE_WINDOW_SECONDS", "0.001"))
 DEFAULT_PROFILE_ID = 0
 
@@ -197,6 +199,20 @@ def _headless_entry_command(dotnet=None):
     return None
 
 
+def _latest_source_mtime(paths):
+    latest = 0.0
+    for path in paths:
+        if os.path.isfile(path):
+            latest = max(latest, os.path.getmtime(path))
+            continue
+        if os.path.isdir(path):
+            for root_dir, _, files in os.walk(path):
+                for filename in files:
+                    if filename.endswith((".cs", ".csproj", ".props", ".targets")):
+                        latest = max(latest, os.path.getmtime(os.path.join(root_dir, filename)))
+    return latest
+
+
 def _ensure_setup(dotnet=None, game_dir=None):
     sts2_dll = os.path.join(LIB_DIR, "sts2.dll")
     resolved_game_dir = _find_game_dir(game_dir)
@@ -208,8 +224,18 @@ def _ensure_setup(dotnet=None, game_dir=None):
         _copy_required_dlls(resolved_game_dir)
 
     output_path = HEADLESS_EXE if os.path.isfile(HEADLESS_EXE) else HEADLESS_DLL
-    should_build = (not os.path.isfile(output_path)) or (
-        os.path.isfile(sts2_dll) and os.path.getmtime(sts2_dll) > os.path.getmtime(output_path)
+    source_mtime = _latest_source_mtime(
+        [
+            HEADLESS_PROJECT,
+            GODOT_STUBS_PROJECT,
+            os.path.join(ROOT, "src", "Sts2Headless"),
+            os.path.join(ROOT, "src", "GodotStubs"),
+        ]
+    )
+    should_build = (
+        not os.path.isfile(output_path)
+        or (os.path.isfile(sts2_dll) and os.path.getmtime(sts2_dll) > os.path.getmtime(output_path))
+        or source_mtime > os.path.getmtime(output_path)
     )
     if should_build:
         if not dotnet:
@@ -353,7 +379,7 @@ class GameInstance:
         if copied:
             print(
                 f"[HTTP-GAME] synced profile{self.profile_id} saves to {len(copied)} files",
-                file=sys.stderr,
+                flush=True,
             )
         return copied
 
@@ -367,6 +393,7 @@ class GameInstance:
         if resolved_game_dir:
             env["STS2_GAME_DIR"] = resolved_game_dir
         env["STS2_PROFILE_ID"] = str(self.profile_id)
+        env["DOTNET_ROLL_FORWARD"] = "LatestMinor"
         if self.profile_dir:
             copied = self._sync_profile_saves_for_worker()
             env["STS2_PROFILE_SAVE_DIR"] = self.profile_dir
@@ -728,7 +755,6 @@ class GameInstance:
                 if stale_matches <= 3:
                     print(
                         f"[HTTP-GAME] stale step payload ignored game_id={self.game_id} action={action.get('action')} matches={stale_matches}",
-                        file=sys.stderr,
                         flush=True,
                     )
                 continue
@@ -1203,6 +1229,44 @@ def _terminate_workers():
     return {"terminated_workers": terminated, "failed_workers": failed}
 
 
+def _reset_worker(worker_key):
+    normalized_key = _normalize_worker_key(worker_key)
+    with game_lock:
+        worker = workers.pop(normalized_key, None)
+        detached_games = [
+            (game_id, game)
+            for game_id, game in list(games.items())
+            if game is worker
+        ]
+        for game_id, _game in detached_games:
+            games.pop(game_id, None)
+
+    closed = []
+    failed = []
+    for game_id, game in detached_games:
+        try:
+            game.close()
+            closed.append(game_id)
+        except Exception as exc:
+            failed.append({"game_id": game_id, "message": str(exc)})
+
+    terminated = False
+    if worker is not None:
+        try:
+            worker.terminate()
+            terminated = True
+        except Exception as exc:
+            failed.append({"worker_key": normalized_key, "message": str(exc)})
+
+    return {
+        "status": "success",
+        "worker_key": normalized_key,
+        "closed": closed,
+        "terminated": terminated,
+        "failed": failed,
+    }
+
+
 def _cleanup_runtime(*, exclude_game_ids=None, terminate_workers=False):
     result = _cleanup_games(exclude_game_ids=exclude_game_ids)
     if terminate_workers:
@@ -1473,6 +1537,11 @@ def cleanup_games():
     return jsonify(_cleanup_runtime(exclude_game_ids=exclude_game_ids, terminate_workers=terminate_workers))
 
 
+@app.route("/admin/workers/<worker_key>/reset", methods=["POST"])
+def reset_worker(worker_key):
+    return jsonify(_reset_worker(worker_key))
+
+
 @app.route("/games", methods=["GET"])
 def list_games():
     with game_lock:
@@ -1495,6 +1564,8 @@ def worker_debug():
                 "worker_key": str(worker_key),
                 "game_id": worker.game_id,
                 "alive": worker.is_alive(),
+                "reserved": bool(worker._reserved),
+                "has_active_session": worker.has_active_session(),
                 "last_action": worker.last_action,
                 "last_error": worker.last_error,
                 "stderr_tail": list(worker._stderr_lines)[-40:],
@@ -1530,7 +1601,7 @@ def health():
         busy_workers = sum(
             1
             for worker in workers.values()
-            if worker.has_active_session() and id(worker) in active_worker_ids
+            if worker.has_active_session()
         )
 
     return jsonify(

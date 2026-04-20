@@ -9,7 +9,7 @@ public class CanvasItem : Node
     public virtual void Show() => Visible = true;
     public virtual void Hide() => Visible = false;
     public bool IsVisibleInTree() => Visible;
-    public Tween CreateTween() => new Tween();
+    public new Tween CreateTween() => new Tween();
     public Rect2 GetViewportRect() => new Rect2(Vector2.Zero, new Vector2(1920, 1080));
 }
 
@@ -42,11 +42,11 @@ public class Control : CanvasItem
     public MouseFilterEnum MouseFilter { get; set; }
     public string TooltipText { get; set; } = "";
 
-    public Rect2 GetViewportRect() => new Rect2(0, 0, 1920, 1080);
+    public new Rect2 GetViewportRect() => new Rect2(0, 0, 1920, 1080);
     public void GrabFocus() { }
     public void ReleaseFocus() { }
     public bool HasFocus() => false;
-    public Viewport? GetViewport() => null;
+    public new Viewport? GetViewport() => null;
 
     public virtual void _GuiInput(InputEvent @event) { }
 
@@ -77,7 +77,7 @@ public class Resource : GodotObject
     public string ResourcePath { get; set; } = "";
     public class MethodName { }
     public class PropertyName { }
-    public class SignalName { }
+    public new class SignalName { }
 }
 
 // PackedScene
@@ -225,7 +225,7 @@ public class Button : Control
         public static readonly StringName Pressed = "Pressed";
     }
     public string Text { get; set; } = "";
-    public event Action? Pressed;
+    public event Action? Pressed { add { } remove { } }
 }
 
 public class BaseButton : Control
@@ -367,13 +367,14 @@ public class AnimationPlayer : Node
     {
         public static readonly StringName AnimationFinished = "AnimationFinished";
     }
-    public void Play(StringName name = default, double customBlend = -1, float customSpeed = 1f, bool fromEnd = false) { }
+    public void Play(StringName name = default!, double customBlend = -1, float customSpeed = 1f, bool fromEnd = false) { }
     public void Stop(bool keepState = false) { }
 }
 
 // Particles
 public class GpuParticles2D : Node2D
 {
+    public int Amount { get; set; }
     public bool Emitting { get; set; }
     public Material? ProcessMaterial { get; set; }
 }
@@ -408,7 +409,7 @@ public class ResourceFormatLoader : GodotObject
 {
     public class MethodName { }
     public class PropertyName { }
-    public class SignalName { }
+    public new class SignalName { }
 
     public virtual Variant _Load(string path, string originalPath, bool useSubThreads, int cacheMode) => default;
     public virtual string[] _GetRecognizedExtensions() => Array.Empty<string>();

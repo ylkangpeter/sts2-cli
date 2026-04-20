@@ -73,6 +73,15 @@ public class Node : GodotObject
         _children.Remove(child);
     }
 
+    public void MoveChild(Node child, int toIndex)
+    {
+        var currentIndex = _children.IndexOf(child);
+        if (currentIndex < 0) return;
+        _children.RemoveAt(currentIndex);
+        var boundedIndex = Math.Clamp(toIndex, 0, _children.Count);
+        _children.Insert(boundedIndex, child);
+    }
+
     public void Reparent(Node newParent)
     {
         _parent?.RemoveChild(this);
@@ -89,6 +98,7 @@ public class Node : GodotObject
     public bool IsAncestorOf(Node node) => false;
     public bool IsInsideTree() => false;
     public int GetChildCount(bool includeInternal = false) => _children.Count;
+    public int GetIndex(bool includeInternal = false) => _parent?._children.IndexOf(this) ?? -1;
 
     public void CallDeferred(StringName method, params Variant[] args) { }
 
@@ -178,7 +188,24 @@ public static class ProjectSettings
 public static class ResourceLoader
 {
     public enum CacheMode { Reuse, Replace, Ignore }
-    public static T? Load<T>(string path, string? typeHint = null, CacheMode cacheMode = CacheMode.Reuse) where T : class => null;
+    public static T? Load<T>(string path, string? typeHint = null, CacheMode cacheMode = CacheMode.Reuse) where T : class
+    {
+        object resource =
+            path.EndsWith(".tscn", StringComparison.OrdinalIgnoreCase) ? new PackedScene() :
+            path.Contains("material", StringComparison.OrdinalIgnoreCase) ? new Material() :
+            path.EndsWith(".png", StringComparison.OrdinalIgnoreCase) ||
+            path.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) ||
+            path.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase) ||
+            path.EndsWith(".webp", StringComparison.OrdinalIgnoreCase) ||
+            path.Contains("atlas", StringComparison.OrdinalIgnoreCase) ? new CompressedTexture2D() :
+            typeof(T) == typeof(PackedScene) ? new PackedScene() :
+            typeof(T) == typeof(Material) ? new Material() :
+            typeof(Texture2D).IsAssignableFrom(typeof(T)) ? new CompressedTexture2D() :
+            new Resource();
+        if (resource is Resource typedResource)
+            typedResource.ResourcePath = path;
+        return resource as T ?? new Resource() as T;
+    }
     public static bool Exists(string path) => false;
     public static bool Exists(string path, string typeHint) => false;
 }

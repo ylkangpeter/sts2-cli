@@ -26,7 +26,7 @@ class Program
         };
         TaskScheduler.UnobservedTaskException += (_, e) =>
         {
-            Console.Error.WriteLine($"[WARN] Unobserved task exception: {e.Exception?.Message}");
+            Console.Error.WriteLine($"[WARN] Unobserved task exception: {e.Exception}");
             e.SetObserved();
         };
 

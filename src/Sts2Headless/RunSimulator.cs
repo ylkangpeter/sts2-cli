@@ -11,6 +11,7 @@ using MegaCrit.Sts2.Core.GameActions;
 using MegaCrit.Sts2.Core.Helpers;
 using MegaCrit.Sts2.Core.Map;
 using MegaCrit.Sts2.Core.Models;
+using MegaCrit.Sts2.Core.Models.Cards;
 using MegaCrit.Sts2.Core.Models.Characters;
 using MegaCrit.Sts2.Core.Multiplayer;
 using MegaCrit.Sts2.Core.CardSelection;
@@ -492,7 +493,8 @@ public class RunSimulator
     private Dictionary<string, object?>? WorstOwnedPotion(Player player)
     {
         Dictionary<string, object?>? worst = null;
-        var potions = player.Potions ?? Array.Empty<PotionModel?>();
+        var potions = player.Potions;
+        if (potions == null) return null;
         foreach (var potion in potions.Select((p, i) => (p, i)))
         {
             if (potion.p == null) continue;
@@ -883,7 +885,7 @@ public class RunSimulator
         {
             try
             {
-                RunManager.Instance.EnterMapCoord(coord).GetAwaiter().GetResult();
+                RunWithSuppressedYield(() => RunManager.Instance.EnterMapCoord(coord).GetAwaiter().GetResult());
             }
             catch (InvalidOperationException ex) when (ex.Message.Contains("relic picking session"))
             {
@@ -893,7 +895,7 @@ public class RunSimulator
                 Thread.Sleep(10);
                 _syncCtx.Pump();
                 WaitForActionExecutor();
-                RunManager.Instance.EnterMapCoord(coord).GetAwaiter().GetResult();
+                RunWithSuppressedYield(() => RunManager.Instance.EnterMapCoord(coord).GetAwaiter().GetResult());
             }
         }, warnMs: 20);
         ProfilePhase("DoMapSelect.post_pump", () => _syncCtx.Pump(), warnMs: 20);
@@ -1375,7 +1377,7 @@ public class RunSimulator
             if (!task.IsCompleted) task.Wait(2000);
             task.GetAwaiter().GetResult();
             _syncCtx.Pump();
-            Log($"Bought relic: {entry.Model.GetType().Name} for {entry.Cost}g");
+            Log($"Bought relic: {entry.Model?.GetType().Name ?? "<unknown>"} for {entry.Cost}g");
         }
         catch (Exception ex)
         {
@@ -1432,7 +1434,7 @@ public class RunSimulator
             if (!task.IsCompleted) task.Wait(2000);
             task.GetAwaiter().GetResult();
             _syncCtx.Pump();
-            Log($"Bought potion: {entry.Model.GetType().Name} for {entry.Cost}g");
+            Log($"Bought potion: {entry.Model?.GetType().Name ?? "<unknown>"} for {entry.Cost}g");
         }
         catch (Exception ex)
         {
@@ -1775,6 +1777,16 @@ public class RunSimulator
                 {
                     try
                     {
+                        if (ShouldSkipHeadlessEventOption(localEvent.GetType().Name, options[optionIndex].TextKey))
+                        {
+                            Log($"Skipping headless-unsafe event option {localEvent.GetType().Name}.{options[optionIndex].TextKey}");
+                            SetPrivateFieldInHierarchy(localEvent, "_isFinished", true);
+                            localEvent.EnsureCleanup();
+                            _eventOptionChosen = false;
+                            _lastEventOptionCount = 0;
+                            ForceToMap();
+                            return MapSelectState();
+                        }
                         _eventOptionChosen = true;
                         _lastEventOptionCount = options.Count;
                         // Run on thread pool so GetSelectedCards/GetSelectedCardReward can block
@@ -1793,7 +1805,39 @@ public class RunSimulator
                             WaitForActionExecutor();
                             return DetectDecisionPoint();
                         }
-                        if (!task.IsCompleted) task.Wait(500);
+                        if (!task.IsCompleted)
+                        {
+                            for (int i = 0; i < 200 && !task.IsCompleted; i++)
+                            {
+                                _syncCtx.Pump();
+                                if (_cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null)
+                                {
+                                    WaitForActionExecutor();
+                                    return DetectDecisionPoint();
+                                }
+                                Thread.Sleep(5);
+                            }
+                        }
+                        if (!task.IsCompleted)
+                        {
+                            Log($"Event {localEvent.GetType().Name} option {optionIndex} did not resolve");
+                            SetPrivateFieldInHierarchy(localEvent, "_isFinished", true);
+                            localEvent.EnsureCleanup();
+                            _eventOptionChosen = false;
+                            _lastEventOptionCount = 0;
+                            ForceToMap();
+                            return MapSelectState();
+                        }
+                        if (task.IsFaulted)
+                        {
+                            var message = task.Exception?.GetBaseException().Message ?? "unknown event option failure";
+                            Log($"Event {localEvent.GetType().Name} option {optionIndex} faulted: {message}; forcing event cleanup");
+                            SetPrivateFieldInHierarchy(localEvent, "_isFinished", true);
+                            localEvent.EnsureCleanup();
+                            _eventOptionChosen = false;
+                            ForceToMap();
+                            return MapSelectState();
+                        }
                         _syncCtx.Pump();
                         if (localEvent.IsFinished || _runState?.CurrentRoom is not EventRoom)
                             skipTerminalWait = true;
@@ -1804,8 +1848,11 @@ public class RunSimulator
                 var optCountAfter = localEvent.CurrentOptions?.Count ?? 0;
                 if (!localEvent.IsFinished && optCountAfter == optCountBefore && optCountAfter > 0)
                 {
-                    Log($"Event {localEvent.GetType().Name} didn't advance, force-finishing");
-                    ForceToMap();
+                    Log($"Event {localEvent.GetType().Name} did not advance; keeping event open");
+                    _eventOptionChosen = false;
+                    if (_runState!.CurrentRoom is EventRoom currentEventRoom)
+                        return EventChoiceState(currentEventRoom);
+                    return DetectDecisionPoint();
                 }
             }
         }
@@ -1813,6 +1860,18 @@ public class RunSimulator
         if (!skipTerminalWait)
             WaitForActionExecutor();
         return DetectDecisionPoint();
+    }
+
+    private static bool ShouldSkipHeadlessEventOption(string eventTypeName, string? textKey)
+    {
+        var eventName = eventTypeName ?? "";
+        var key = (textKey ?? "").ToUpperInvariant();
+        if (eventName.Contains("Amalgamator", StringComparison.OrdinalIgnoreCase))
+            return true;
+        if (eventName.Contains("JungleMazeAdventure", StringComparison.OrdinalIgnoreCase) &&
+            key.Contains("SAFETY_IN_NUMBERS", StringComparison.OrdinalIgnoreCase))
+            return true;
+        return false;
     }
 
     private Dictionary<string, object?> DoLeaveRoom(Player player)
@@ -2010,7 +2069,7 @@ public class RunSimulator
         // Check if there's a pending card reward
         if (_pendingCardReward != null)
         {
-            decision = CardRewardState(player, _runState.CurrentRoom as CombatRoom);
+            decision = CardRewardState(player, _runState!.CurrentRoom as CombatRoom);
             return true;
         }
 
@@ -2089,6 +2148,13 @@ public class RunSimulator
                 _syncCtx.Pump();
                 WaitForActionExecutor();
                 Thread.Sleep(5);
+                if (TryGetPendingDecision(player, out var delayedPendingDecision))
+                {
+                    combatSw.Stop();
+                    if (combatSw.Elapsed.TotalMilliseconds >= 50)
+                        Log($"perf DetectDecisionPoint(combat) took {combatSw.Elapsed.TotalMilliseconds:F1}ms");
+                    return delayedPendingDecision;
+                }
                 if (CombatManager.Instance.IsPlayPhase)
                 {
                     combatSw.Stop();
@@ -2606,6 +2672,19 @@ public class RunSimulator
     {
         try
         {
+            var localEvent = RunManager.Instance.EventSynchronizer?.GetLocalEvent();
+            if (localEvent != null && !localEvent.IsFinished)
+            {
+                SetPrivateFieldInHierarchy(localEvent, "_isFinished", true);
+                localEvent.EnsureCleanup();
+                _eventOptionChosen = false;
+                _lastEventOptionCount = 0;
+            }
+        }
+        catch { }
+
+        try
+        {
             RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult();
             _syncCtx.Pump();
         }
@@ -2624,6 +2703,23 @@ public class RunSimulator
         }
     }
 
+    private static void SetPrivateFieldInHierarchy(object target, string fieldName, object? value)
+    {
+        var type = target.GetType();
+        while (type != null)
+        {
+            var field = type.GetField(
+                fieldName,
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            if (field != null)
+            {
+                field.SetValue(target, value);
+                return;
+            }
+            type = type.BaseType;
+        }
+    }
+
     private Dictionary<string, object?> EventChoiceState(EventRoom eventRoom)
     {
         var localEvent = RunManager.Instance.EventSynchronizer?.GetLocalEvent();
@@ -2637,10 +2733,9 @@ public class RunSimulator
                 _lastEventOptionCount > 0 && currentOpts.Count == _lastEventOptionCount;
             if (sameOptions)
             {
-                Log($"Event {localEvent.GetType().Name}: same options after choice, force-finishing");
+                Log($"Event {localEvent.GetType().Name}: same options after choice, keeping event open");
                 _eventOptionChosen = false;
-                ForceToMap();
-                return MapSelectState();
+                return EventChoiceState(eventRoom);
             }
             // Options changed — event advanced to next page, show new options
             _eventOptionChosen = false;
@@ -3024,6 +3119,20 @@ public class RunSimulator
             sw.Stop();
             if (sw.Elapsed.TotalMilliseconds >= 50)
                 Log($"perf WaitForActionExecutor took {sw.Elapsed.TotalMilliseconds:F1}ms");
+        }
+    }
+
+    private static void RunWithSuppressedYield(Action action)
+    {
+        var previous = YieldPatches.SuppressYield;
+        YieldPatches.SuppressYield = true;
+        try
+        {
+            action();
+        }
+        finally
+        {
+            YieldPatches.SuppressYield = previous;
         }
     }
 
@@ -3441,10 +3550,6 @@ public class RunSimulator
         }
         catch (Exception ex) { Console.Error.WriteLine($"[WARN] SaveManager.InitProfileId(profile{_profileId}): {ex.Message}"); }
 
-        // Initialize progress data for epoch/timeline tracking
-        try { SaveManager.Instance.InitProgressData(); }
-        catch (Exception ex) { Console.Error.WriteLine($"[WARN] InitProgressData: {ex.Message}"); }
-
         // Install the Task.Yield patch but keep SuppressYield=false by default.
         // SuppressYield is toggled to true only during EndTurn to prevent boss fight deadlocks.
         PatchTaskYield();
@@ -3454,6 +3559,18 @@ public class RunSimulator
         // Vantom's Dismember move adding Wounds). In headless mode, these never complete
         // because there's no Godot scene tree, causing the ActionExecutor to deadlock.
         PatchCmdWait();
+
+        // Avoid noisy and fragile real asset loads in headless mode. Logic does not need
+        // textures/scenes/materials, so cache misses should resolve to dummy resources.
+        PatchAssetCache();
+
+        // Vantom's Dismember move has unguarded UI/VFX calls in the middle of otherwise
+        // valid combat logic. Replace it with a logic-equivalent headless version.
+        PatchVantomDismember();
+        PatchCrystalSphereMinigame();
+        PatchCrusherHeadless();
+        PatchSlumberingBeetleHeadless();
+        PatchAdditionalHeadlessNoOps();
 
         // Initialize localization system (needed for events, cards, etc.)
         InitLocManager();
@@ -3476,6 +3593,11 @@ public class RunSimulator
             }
         }
         Console.Error.WriteLine($"[INFO] ModelDb: {registered} registered, {failed} failed out of {subtypes.Count}");
+
+        // Initialize progress data after ModelDb registration. Progress deserialization
+        // references character IDs such as CHARACTER.IRONCLAD.
+        try { SaveManager.Instance.InitProgressData(); }
+        catch (Exception ex) { Console.Error.WriteLine($"[WARN] InitProgressData: {ex.Message}"); }
 
         // Initialize net ID serialization cache (needed for combat actions)
         try
@@ -3618,6 +3740,189 @@ public class RunSimulator
         }
     }
 
+    private static void PatchAssetCache()
+    {
+        try
+        {
+            var assetCacheType = typeof(CombatManager).Assembly.GetType("MegaCrit.Sts2.Core.Assets.AssetCache");
+            var loadAsset = assetCacheType?.GetMethod(
+                "LoadAsset",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            var prefix = typeof(YieldPatches).GetMethod(
+                nameof(YieldPatches.AssetCacheLoadAssetPrefix),
+                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
+            if (loadAsset == null || prefix == null)
+            {
+                Console.Error.WriteLine("[WARN] Could not resolve AssetCache.LoadAsset patch methods");
+                return;
+            }
+
+            new Harmony("sts2headless.assetcache").Patch(loadAsset, new HarmonyMethod(prefix));
+            Console.Error.WriteLine("[INFO] Patched AssetCache.LoadAsset for headless dummy resources");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] Failed to patch AssetCache.LoadAsset: {ex.Message}");
+        }
+    }
+
+    private static void PatchVantomDismember()
+    {
+        try
+        {
+            var sts2Asm = typeof(CombatManager).Assembly;
+            var vantomType = sts2Asm.GetType("MegaCrit.Sts2.Core.Models.Monsters.Vantom");
+            if (vantomType == null)
+            {
+                Console.Error.WriteLine("[WARN] Could not find Vantom type for headless Dismember patch");
+                return;
+            }
+
+            var dismember = vantomType.GetMethod(
+                "DismemberMove",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            var prefix = typeof(YieldPatches).GetMethod(
+                nameof(YieldPatches.VantomDismemberPrefix),
+                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
+            if (dismember == null || prefix == null)
+            {
+                Console.Error.WriteLine("[WARN] Could not resolve Vantom Dismember patch methods");
+                return;
+            }
+
+            var harmony = new Harmony("sts2headless.vantom.dismember");
+            harmony.Patch(dismember, new HarmonyMethod(prefix));
+            Console.Error.WriteLine("[INFO] Patched Vantom Dismember for headless logic");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] Failed to patch Vantom Dismember: {ex.Message}");
+        }
+    }
+
+    private static void PatchCrystalSphereMinigame()
+    {
+        try
+        {
+            var minigameType = typeof(CombatManager).Assembly.GetType(
+                "MegaCrit.Sts2.Core.Events.Custom.CrystalSphereEvent.CrystalSphereMinigame");
+            var playMinigame = minigameType?.GetMethod(
+                "PlayMinigame",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public);
+            var prefix = typeof(YieldPatches).GetMethod(
+                nameof(YieldPatches.CompletedTaskPrefix),
+                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
+            if (playMinigame == null || prefix == null)
+            {
+                Console.Error.WriteLine("[WARN] Could not resolve CrystalSphere minigame patch methods");
+                return;
+            }
+
+            new Harmony("sts2headless.crystalsphere").Patch(playMinigame, new HarmonyMethod(prefix));
+            Console.Error.WriteLine("[INFO] Patched CrystalSphere minigame to no-op in headless mode");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] Failed to patch CrystalSphere minigame: {ex.Message}");
+        }
+    }
+
+    private static void PatchCrusherHeadless()
+    {
+        try
+        {
+            var crusherType = typeof(CombatManager).Assembly.GetType("MegaCrit.Sts2.Core.Models.Monsters.Crusher");
+            if (crusherType == null)
+            {
+                Console.Error.WriteLine("[WARN] Could not find Crusher type for headless patch");
+                return;
+            }
+
+            var harmony = new Harmony("sts2headless.crusher");
+            PatchHeadlessMethod(harmony, crusherType, "AfterCurrentHpChanged", nameof(YieldPatches.CompletedTaskPrefix));
+            PatchHeadlessMethod(harmony, crusherType, "BeforeDeath", nameof(YieldPatches.CompletedTaskPrefix));
+            PatchHeadlessMethod(harmony, crusherType, "ThrashMove", nameof(YieldPatches.CrusherThrashPrefix));
+            PatchHeadlessMethod(harmony, crusherType, "BugStingMove", nameof(YieldPatches.CrusherBugStingPrefix));
+            PatchHeadlessMethod(harmony, crusherType, "AdaptMove", nameof(YieldPatches.CrusherAdaptPrefix));
+            PatchHeadlessMethod(harmony, crusherType, "EnlargingStrikeMove", nameof(YieldPatches.CrusherEnlargingStrikePrefix));
+            PatchHeadlessMethod(harmony, crusherType, "GuardedStrikeMove", nameof(YieldPatches.CrusherGuardedStrikePrefix));
+            Console.Error.WriteLine("[INFO] Patched Crusher UI-dependent moves for headless logic");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] Failed to patch Crusher headless logic: {ex.Message}");
+        }
+    }
+
+    private static void PatchSlumberingBeetleHeadless()
+    {
+        try
+        {
+            var beetleType = typeof(CombatManager).Assembly.GetType("MegaCrit.Sts2.Core.Models.Monsters.SlumberingBeetle");
+            if (beetleType == null)
+            {
+                Console.Error.WriteLine("[WARN] Could not find SlumberingBeetle type for headless patch");
+                return;
+            }
+
+            var harmony = new Harmony("sts2headless.slumberingbeetle");
+            PatchHeadlessMethod(harmony, beetleType, "AfterAddedToRoom", nameof(YieldPatches.SlumberingBeetleAfterAddedPrefix));
+            PatchHeadlessMethod(harmony, beetleType, "WakeUpMove", nameof(YieldPatches.SlumberingBeetleWakeUpPrefix));
+            Console.Error.WriteLine("[INFO] Patched SlumberingBeetle UI-dependent setup for headless logic");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] Failed to patch SlumberingBeetle headless logic: {ex.Message}");
+        }
+    }
+
+    private static void PatchAdditionalHeadlessNoOps()
+    {
+        var harmony = new Harmony("sts2headless.additional.noops");
+        var assembly = typeof(CombatManager).Assembly;
+
+        TryPatchHeadlessMethod(harmony, assembly, "MegaCrit.Sts2.Core.Models.Monsters.Rocket", "TargetingReticleMove", nameof(YieldPatches.CompletedTaskPrefix));
+        TryPatchHeadlessMethod(harmony, assembly, "MegaCrit.Sts2.Core.Models.Monsters.Rocket", "AfterCurrentHpChanged", nameof(YieldPatches.CompletedTaskPrefix));
+        TryPatchHeadlessMethod(harmony, assembly, "MegaCrit.Sts2.Core.Models.Monsters.DecimillipedeSegment", "ReattachMove", nameof(YieldPatches.CompletedTaskPrefix));
+        TryPatchHeadlessMethod(harmony, assembly, "MegaCrit.Sts2.Core.Models.Monsters.DecimillipedeSegment", "ChangePhobiaModeTexture", nameof(YieldPatches.VoidPrefix));
+        TryPatchHeadlessMethod(harmony, assembly, "MegaCrit.Sts2.Core.Models.Cards.Havoc", "OnPlay", nameof(YieldPatches.CompletedTaskPrefix));
+        TryPatchHeadlessMethod(harmony, assembly, "MegaCrit.Sts2.Core.Models.Potions.DistilledChaos", "OnUse", nameof(YieldPatches.CompletedTaskPrefix));
+    }
+
+    private static void TryPatchHeadlessMethod(Harmony harmony, System.Reflection.Assembly assembly, string typeName, string methodName, string patchName)
+    {
+        var type = assembly.GetType(typeName);
+        if (type == null) return;
+        var method = type.GetMethod(
+            methodName,
+            System.Reflection.BindingFlags.Instance |
+            System.Reflection.BindingFlags.Public |
+            System.Reflection.BindingFlags.NonPublic);
+        var prefix = typeof(YieldPatches).GetMethod(
+            patchName,
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
+        if (method == null || prefix == null) return;
+        harmony.Patch(method, new HarmonyMethod(prefix));
+    }
+
+    private static void PatchHeadlessMethod(Harmony harmony, Type type, string methodName, string patchName)
+    {
+        var method = type.GetMethod(
+            methodName,
+            System.Reflection.BindingFlags.Instance |
+            System.Reflection.BindingFlags.Public |
+            System.Reflection.BindingFlags.NonPublic);
+        var prefix = typeof(YieldPatches).GetMethod(
+            patchName,
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
+        if (method == null || prefix == null)
+        {
+            Console.Error.WriteLine($"[WARN] Could not resolve {type.Name}.{methodName} headless patch");
+            return;
+        }
+        harmony.Patch(method, new HarmonyMethod(prefix));
+    }
+
     /// <summary>
     /// Card selector for headless mode — picks first available card for any selection prompt.
     /// Used by cards like Headbutt, Armaments, etc. that need player to choose a card.
@@ -3748,6 +4053,170 @@ public class RunSimulator
         {
             __result = Task.CompletedTask;
             return false; // Skip original method
+        }
+
+        public static bool CompletedTaskPrefix(ref Task __result)
+        {
+            __result = Task.CompletedTask;
+            return false;
+        }
+
+        public static bool VoidPrefix()
+        {
+            return false;
+        }
+
+        public static bool VantomDismemberPrefix(object __instance, IReadOnlyList<Creature> targets, ref Task __result)
+        {
+            __result = VantomDismemberHeadless(__instance, targets);
+            return false;
+        }
+
+        private static async Task VantomDismemberHeadless(object instance, IReadOnlyList<Creature> targets)
+        {
+            var damageProp = instance.GetType().GetProperty(
+                "DismemberDamage",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            var damage = damageProp?.GetValue(instance) is int value ? value : 27;
+            await DamageCmd.Attack(damage).FromMonster((MonsterModel)instance).WithNoAttackerAnim().Execute(null);
+            await CardPileCmd.AddToCombatAndPreview<Wound>(targets, PileType.Discard, 3, addedByPlayer: false);
+        }
+
+        public static bool CrusherThrashPrefix(object __instance, IReadOnlyList<Creature> targets, ref Task __result)
+        {
+            __result = CrusherAttackHeadless(__instance, "ThrashDamage");
+            return false;
+        }
+
+        public static bool CrusherBugStingPrefix(object __instance, IReadOnlyList<Creature> targets, ref Task __result)
+        {
+            __result = CrusherBugStingHeadless(__instance, targets);
+            return false;
+        }
+
+        public static bool CrusherAdaptPrefix(object __instance, IReadOnlyList<Creature> targets, ref Task __result)
+        {
+            __result = PowerCmd.Apply<StrengthPower>(
+                ((MonsterModel)__instance).Creature,
+                GetIntProperty(__instance, "AdaptStrengthGain", 2),
+                ((MonsterModel)__instance).Creature,
+                null);
+            return false;
+        }
+
+        public static bool CrusherEnlargingStrikePrefix(object __instance, IReadOnlyList<Creature> targets, ref Task __result)
+        {
+            __result = CrusherAttackHeadless(__instance, "EnlargingStrikeDamage");
+            return false;
+        }
+
+        public static bool CrusherGuardedStrikePrefix(object __instance, IReadOnlyList<Creature> targets, ref Task __result)
+        {
+            __result = CrusherGuardedStrikeHeadless(__instance);
+            return false;
+        }
+
+        public static bool SlumberingBeetleAfterAddedPrefix(object __instance, ref Task __result)
+        {
+            __result = SlumberingBeetleAfterAddedHeadless(__instance);
+            return false;
+        }
+
+        public static bool SlumberingBeetleWakeUpPrefix(object __instance, ref Task __result)
+        {
+            __result = SlumberingBeetleWakeUpHeadless(__instance);
+            return false;
+        }
+
+        private static Task CrusherAttackHeadless(object instance, string damageProperty)
+        {
+            var damage = GetIntProperty(instance, damageProperty, 1);
+            return DamageCmd.Attack(damage)
+                .FromMonster((MonsterModel)instance)
+                .WithNoAttackerAnim()
+                .Execute(null);
+        }
+
+        private static async Task CrusherBugStingHeadless(object instance, IReadOnlyList<Creature> targets)
+        {
+            var damage = GetIntProperty(instance, "BugStingDamage", 6);
+            var times = GetIntProperty(instance, "BugStingTimes", 2);
+            await DamageCmd.Attack(damage)
+                .WithHitCount(times)
+                .FromMonster((MonsterModel)instance)
+                .WithNoAttackerAnim()
+                .Execute(null);
+            await PowerCmd.Apply<WeakPower>(targets, 2m, ((MonsterModel)instance).Creature, null);
+            await PowerCmd.Apply<FrailPower>(targets, 2m, ((MonsterModel)instance).Creature, null);
+        }
+
+        private static async Task CrusherGuardedStrikeHeadless(object instance)
+        {
+            var monster = (MonsterModel)instance;
+            await CrusherAttackHeadless(instance, "GuardedStrikeDamage");
+            await CreatureCmd.GainBlock(
+                monster.Creature,
+                18m,
+                MegaCrit.Sts2.Core.ValueProps.ValueProp.Move,
+                null);
+        }
+
+        private static async Task SlumberingBeetleAfterAddedHeadless(object instance)
+        {
+            var monster = (MonsterModel)instance;
+            await PowerCmd.Apply<PlatingPower>(
+                monster.Creature,
+                GetIntProperty(instance, "PlatingAmount", 15),
+                monster.Creature,
+                null);
+            await PowerCmd.Apply<SlumberPower>(monster.Creature, 3m, monster.Creature, null);
+        }
+
+        private static async Task SlumberingBeetleWakeUpHeadless(object instance)
+        {
+            var monster = (MonsterModel)instance;
+            SetBoolProperty(instance, "IsAwake", true);
+            if (monster.Creature.HasPower<PlatingPower>())
+            {
+                await PowerCmd.Remove(monster.Creature.GetPower<PlatingPower>());
+            }
+        }
+
+        private static int GetIntProperty(object instance, string name, int fallback)
+        {
+            var property = instance.GetType().GetProperty(
+                name,
+                System.Reflection.BindingFlags.Instance |
+                System.Reflection.BindingFlags.Public |
+                System.Reflection.BindingFlags.NonPublic);
+            return property?.GetValue(instance) is int value ? value : fallback;
+        }
+
+        private static void SetBoolProperty(object instance, string name, bool value)
+        {
+            var property = instance.GetType().GetProperty(
+                name,
+                System.Reflection.BindingFlags.Instance |
+                System.Reflection.BindingFlags.Public |
+                System.Reflection.BindingFlags.NonPublic);
+            property?.SetValue(instance, value);
+        }
+
+        public static bool AssetCacheLoadAssetPrefix(object __instance, string path, ref Godot.Resource __result)
+        {
+            Godot.Resource resource =
+                path.EndsWith(".tscn", StringComparison.OrdinalIgnoreCase) ? new Godot.PackedScene() :
+                path.Contains("material", StringComparison.OrdinalIgnoreCase) ? new Godot.Material() :
+                path.EndsWith(".png", StringComparison.OrdinalIgnoreCase) ||
+                path.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) ||
+                path.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase) ||
+                path.EndsWith(".webp", StringComparison.OrdinalIgnoreCase) ||
+                path.Contains("atlas", StringComparison.OrdinalIgnoreCase) ? new Godot.CompressedTexture2D() :
+                new Godot.Resource();
+            resource.ResourcePath = path;
+            __instance.GetType().GetMethod("SetAsset")?.Invoke(__instance, new object[] { path, resource });
+            __result = resource;
+            return false;
         }
     }
 
@@ -3960,6 +4429,45 @@ public class RunSimulator
             }
             catch (Exception ex) { Console.Error.WriteLine($"[WARN] Neutralize patch: {ex.Message}"); }
 
+            // Patch FlashOfSteel.OnPlay to keep its damage+draw logic without UI/VFX nodes.
+            try
+            {
+                var flashType = typeof(MegaCrit.Sts2.Core.Models.Cards.FlashOfSteel);
+                var flashOnPlay = flashType.GetMethod("OnPlay",
+                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+                if (flashOnPlay != null)
+                {
+                    var flashPrefix = typeof(LocPatches).GetMethod(nameof(LocPatches.FlashOfSteelPrefix),
+                        System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
+                    if (flashPrefix != null)
+                    {
+                        harmony.Patch(flashOnPlay, new HarmonyMethod(flashPrefix));
+                        Console.Error.WriteLine("[INFO] Patched FlashOfSteel.OnPlay");
+                    }
+                }
+            }
+            catch (Exception ex) { Console.Error.WriteLine($"[WARN] FlashOfSteel patch: {ex.Message}"); }
+
+            // Cascade auto-plays from the draw pile through the choice context stack,
+            // which can leave headless workers in a corrupted player-choice state.
+            try
+            {
+                var cascadeType = typeof(MegaCrit.Sts2.Core.Models.Cards.Cascade);
+                var cascadeOnPlay = cascadeType.GetMethod("OnPlay",
+                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+                if (cascadeOnPlay != null)
+                {
+                    var cascadePrefix = typeof(LocPatches).GetMethod(nameof(LocPatches.CascadePrefix),
+                        System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
+                    if (cascadePrefix != null)
+                    {
+                        harmony.Patch(cascadeOnPlay, new HarmonyMethod(cascadePrefix));
+                        Console.Error.WriteLine("[INFO] Patched Cascade.OnPlay");
+                    }
+                }
+            }
+            catch (Exception ex) { Console.Error.WriteLine($"[WARN] Cascade patch: {ex.Message}"); }
+
             // Patch HasEntry to always return true
             PatchMethod(harmony, typeof(LocTable), "HasEntry", nameof(LocPatches.HasEntryPrefix));
 
@@ -4045,6 +4553,34 @@ public class RunSimulator
                     card.Owner.Creature, card);
             }
             catch (Exception ex) { Console.Error.WriteLine($"[WARN] Neutralize safe: {ex.Message}"); }
+        }
+
+        /// <summary>Harmony prefix: replace FlashOfSteel.OnPlay with safe damage+draw.</summary>
+        public static bool FlashOfSteelPrefix(CardModel __instance, ref Task __result,
+            PlayerChoiceContext choiceContext, CardPlay cardPlay)
+        {
+            if (cardPlay.Target == null) { __result = Task.CompletedTask; return false; }
+            __result = FlashOfSteelSafe(__instance, choiceContext, cardPlay);
+            return false;
+        }
+
+        private static async Task FlashOfSteelSafe(CardModel card, PlayerChoiceContext ctx, CardPlay play)
+        {
+            try
+            {
+                await CreatureCmd.Damage(ctx, play.Target!, card.DynamicVars.Damage.BaseValue,
+                    MegaCrit.Sts2.Core.ValueProps.ValueProp.Move, card);
+                await CardPileCmd.Draw(ctx, card.DynamicVars.Cards.BaseValue, card.Owner);
+            }
+            catch (Exception ex) { Console.Error.WriteLine($"[WARN] FlashOfSteel safe: {ex.Message}"); }
+        }
+
+        /// <summary>Harmony prefix: disable Cascade's choice-context auto-play path in headless.</summary>
+        public static bool CascadePrefix(CardModel __instance, ref Task __result,
+            PlayerChoiceContext choiceContext, CardPlay cardPlay)
+        {
+            __result = Task.CompletedTask;
+            return false;
         }
 
         public static bool HasEntryPrefix(ref bool __result)
