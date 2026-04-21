@@ -3885,6 +3885,8 @@ public class RunSimulator
         TryPatchHeadlessMethod(harmony, assembly, "MegaCrit.Sts2.Core.Models.Monsters.Rocket", "AfterCurrentHpChanged", nameof(YieldPatches.CompletedTaskPrefix));
         TryPatchHeadlessMethod(harmony, assembly, "MegaCrit.Sts2.Core.Models.Monsters.DecimillipedeSegment", "ReattachMove", nameof(YieldPatches.CompletedTaskPrefix));
         TryPatchHeadlessMethod(harmony, assembly, "MegaCrit.Sts2.Core.Models.Monsters.DecimillipedeSegment", "ChangePhobiaModeTexture", nameof(YieldPatches.VoidPrefix));
+        TryPatchHeadlessMethod(harmony, assembly, "MegaCrit.Sts2.Core.Models.Monsters.SoulNexus", "AfterDeath", nameof(YieldPatches.VoidPrefix));
+        TryPatchHeadlessMethod(harmony, assembly, "MegaCrit.Sts2.Core.Models.Monsters.SoulNexus", "BeforeRemovedFromRoom", nameof(YieldPatches.VoidPrefix));
         TryPatchHeadlessMethod(harmony, assembly, "MegaCrit.Sts2.Core.Models.Cards.Havoc", "OnPlay", nameof(YieldPatches.CompletedTaskPrefix));
         TryPatchHeadlessMethod(harmony, assembly, "MegaCrit.Sts2.Core.Models.Potions.DistilledChaos", "OnUse", nameof(YieldPatches.CompletedTaskPrefix));
     }
@@ -3893,16 +3895,18 @@ public class RunSimulator
     {
         var type = assembly.GetType(typeName);
         if (type == null) return;
-        var method = type.GetMethod(
-            methodName,
-            System.Reflection.BindingFlags.Instance |
-            System.Reflection.BindingFlags.Public |
-            System.Reflection.BindingFlags.NonPublic);
+        var methods = type.GetMethods(
+                System.Reflection.BindingFlags.Instance |
+                System.Reflection.BindingFlags.Public |
+                System.Reflection.BindingFlags.NonPublic)
+            .Where(method => method.Name == methodName && method.DeclaringType == type && !method.IsAbstract)
+            .ToList();
         var prefix = typeof(YieldPatches).GetMethod(
             patchName,
             System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
-        if (method == null || prefix == null) return;
-        harmony.Patch(method, new HarmonyMethod(prefix));
+        if (methods.Count == 0 || prefix == null) return;
+        foreach (var method in methods)
+            harmony.Patch(method, new HarmonyMethod(prefix));
     }
 
     private static void PatchHeadlessMethod(Harmony harmony, Type type, string methodName, string patchName)
