@@ -1535,7 +1535,12 @@ public class RunSimulator
     private Dictionary<string, object?> DoSelectCards(Player player, Dictionary<string, object?>? args)
     {
         if (!_cardSelector.HasPending)
-            return Error("No pending card selection");
+        {
+            Log("select_cards requested but no pending selection; refreshing decision point");
+            _syncCtx.Pump();
+            WaitForActionExecutor();
+            return DetectDecisionPoint();
+        }
         if (args == null || !args.ContainsKey("indices"))
             return Error("select_cards requires 'indices' (comma-separated card indices)");
 
@@ -1601,7 +1606,11 @@ public class RunSimulator
             _cardSelector.CancelPending();
             _syncCtx.Pump();
             WaitForActionExecutor();
+            return DetectDecisionPoint();
         }
+        Log("skip_select requested but no pending selection; refreshing decision point");
+        _syncCtx.Pump();
+        WaitForActionExecutor();
         return DetectDecisionPoint();
     }
 
