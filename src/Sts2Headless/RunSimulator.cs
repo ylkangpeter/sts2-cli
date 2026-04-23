@@ -1068,6 +1068,21 @@ public class RunSimulator
                     WaitForCombatDecisionReady();
                     if (CombatManager.Instance.IsInProgress && !CombatManager.Instance.IsPlayPhase && !player.Creature.IsDead)
                     {
+                        // Knowledge Demon and a few other encounters can transition into a
+                        // non-play-phase pending selection (e.g. curse card_select) right after end_turn.
+                        // Treat that as a decision point instead of forcing a synthetic defeat.
+                        PumpForTransitionPendingDecision(24);
+                        if (_pendingBundles != null || _cardSelector.HasPendingReward || _cardSelector.HasPending || _pendingCardReward != null)
+                        {
+                            Log("Enemy turn entered pending decision while not in play phase; returning decision state");
+                            return DetectDecisionPoint();
+                        }
+                        if (TryGetPendingDecision(player, out var pendingDecision))
+                        {
+                            Log("Enemy turn produced delayed pending decision; returning it directly");
+                            return pendingDecision;
+                        }
+
                         _lastKnownHp = player.Creature?.CurrentHp ?? _lastKnownHp;
                         Log("Enemy turn failed to resolve after transition; forcing defeat state to avoid stuck combat");
                         return GameOverState(false);
