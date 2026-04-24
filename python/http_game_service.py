@@ -103,6 +103,8 @@ def _find_dotnet():
                 [candidate, "--version"],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=5,
                 **_windows_subprocess_kwargs(),
             )
@@ -246,6 +248,8 @@ def _ensure_setup(dotnet=None, game_dir=None):
             [dotnet, "build", PROJECT, "-c", BUILD_CONFIGURATION],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=300,
             **_windows_subprocess_kwargs(),
         )
@@ -1120,6 +1124,7 @@ def _acquire_worker(worker_key, game_dir=None, profile_id=None, profile_dir=None
     explicit_worker = worker_key not in (None, "")
     normalized_key = _normalize_worker_key(worker_key)
     stale_worker = None
+    worker_to_create = None
     with game_lock:
         if not explicit_worker:
             dead_keys = [
@@ -1171,14 +1176,53 @@ def _acquire_worker(worker_key, game_dir=None, profile_id=None, profile_dir=None
                 worker = None
 
         if worker is None:
-            worker = GameInstance(
+            worker_to_create = (
                 normalized_key,
-                game_dir=game_dir,
-                profile_id=profile_id,
-                profile_dir=profile_dir,
+                game_dir,
+                profile_id,
+                profile_dir,
             )
-            workers[normalized_key] = worker
-        worker._reserved = True
+        else:
+            worker._reserved = True
+            worker_to_create = None
+
+    if worker_to_create is None:
+        if stale_worker is not None:
+            try:
+                stale_worker.terminate()
+            except Exception:
+                pass
+        return worker
+
+    create_key, create_game_dir, create_profile_id, create_profile_dir = worker_to_create
+    created_worker = GameInstance(
+        create_key,
+        game_dir=create_game_dir,
+        profile_id=create_profile_id,
+        profile_dir=create_profile_dir,
+    )
+    worker = created_worker
+    try:
+        with game_lock:
+            existing = workers.get(create_key)
+            if existing is None:
+                workers[create_key] = created_worker
+                worker = created_worker
+            else:
+                worker = existing
+            worker._reserved = True
+    except Exception:
+        try:
+            created_worker.terminate()
+        except Exception:
+            pass
+        raise
+
+    if worker is not created_worker:
+        try:
+            created_worker.terminate()
+        except Exception:
+            pass
     if stale_worker is not None:
         try:
             stale_worker.terminate()
