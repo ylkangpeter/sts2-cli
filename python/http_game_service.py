@@ -1444,7 +1444,10 @@ def start_game():
     profile_id = data.get("profile_id")
     profile_dir = data.get("profile_dir")
     worker_slot = data.get("worker_slot")
-    game_id = f"{seed}_{int(time.time())}"
+    worker_key = _normalize_worker_key(worker_slot)
+    # time.time() has one-second resolution here and collides when two
+    # deterministic probes start the same seed concurrently.
+    game_id = f"{seed}_{worker_key}_{time.time_ns()}"
 
     try:
         game = _acquire_worker(
