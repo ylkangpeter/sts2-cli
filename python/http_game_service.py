@@ -1682,13 +1682,26 @@ if __name__ == "__main__":
     try:
         from waitress import serve
 
+        # Keep idle HTTP channels short-lived on Windows to avoid socket buildup
+        # under high-frequency RL polling traffic.
+        http_threads = int(os.environ.get("STS2_HTTP_THREADS", "24"))
+        http_connection_limit = int(os.environ.get("STS2_HTTP_CONNECTION_LIMIT", "384"))
+        http_channel_timeout = int(os.environ.get("STS2_HTTP_CHANNEL_TIMEOUT", "20"))
+        http_cleanup_interval = int(os.environ.get("STS2_HTTP_CLEANUP_INTERVAL", "5"))
+        print(
+            f"waitress config: threads={http_threads} "
+            f"connection_limit={http_connection_limit} "
+            f"channel_timeout={http_channel_timeout}s "
+            f"cleanup_interval={http_cleanup_interval}s"
+        )
         serve(
             app,
             host="0.0.0.0",
             port=5000,
-            threads=int(os.environ.get("STS2_HTTP_THREADS", "32")),
-            connection_limit=int(os.environ.get("STS2_HTTP_CONNECTION_LIMIT", "256")),
-            channel_timeout=int(os.environ.get("STS2_HTTP_CHANNEL_TIMEOUT", "120")),
+            threads=http_threads,
+            connection_limit=http_connection_limit,
+            channel_timeout=http_channel_timeout,
+            cleanup_interval=http_cleanup_interval,
         )
     except ImportError:
         print("waitress 未安装，回退到 Flask dev server")
